@@ -34,23 +34,35 @@ import (
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/oauthutil"
 	"go.etcd.io/bbolt"
+	"golang.org/x/oauth2"
 	"golang.org/x/sync/singleflight"
 )
 
 var netExplorerForbiddenNameChars = regexp.MustCompile(`[\\/:*?"<>|]`)
 
+const (
+	defaultBaseURL = "https://org.netexplorer.pro"
+	//rcloneClientID              = "ig02bVi19GPWyaAn6S60i2MelF1g29IrCA5NqRYvCr8"
+	//rcloneEncryptedClientSecret = "XJUaxXVsjnDH7V2ESPlHPagg5BLDEWTqQjRzmKyOhbxcg0OFZz_2k6YWTzzvEeMKxgMTYWa1WrIYnvA"
+
+	// TEST JOHAN
+	//rcloneClientID              = "FdjdTmAuHMK5q9xio-n7RiI3mVZZDhN-I8VI4bYy_60"
+	//rcloneEncryptedClientSecret = "dREEbXK8AGbIXs8N8B9VQ3djIxilorZv0DB1ZwgZGOndow0BBXjdfDrjfL3npLyax2MMhrqF6xus150"
+
+	// TEST NE-PREPROD
+	rcloneClientID              = "1hDBH_cgxYKmvtX0hFU5yDQEKRygqhOJrkf00a3uQt6"
+	rcloneEncryptedClientSecret = "5VflbKiuQnGwpZAjaCfHWoTySRxTXMCC5UZJLpUTVU8vYjGYNaRifepBEbLupu-AXwxQrQC32r3x66c"
+)
+
 // NetExplorer is the API client
 type NetExplorer struct {
-	BaseURL  string
-	Token    string
-	ClientID string
-	// ConfigName is the rclone remote config section name where token
-	// values are stored. This is set to the remote name passed to NewFs
-	// so external processes updating the rclone config can be detected.
-	ConfigName string
-	Client     *http.Client
-	opt        *Options
+	BaseURL     string
+	Token       string
+	Client      *http.Client
+	tokenSource *oauthutil.TokenSource
+	opt         *Options
 }
 
 // a node in the folder tree returned by depth>1
@@ -233,7 +245,7 @@ func sanitizeFileName(fileName string) (string, bool) {
 
 func NewNetExplorer() *NetExplorer {
 	return &NetExplorer{
-		BaseURL: "https://files.netexplorer.pro",
+		BaseURL: defaultBaseURL,
 		// Use a 16-minute overall HTTP timeout to better accommodate very large uploads.
 		Client: createOptimizedHTTPClient(16 * 60),
 	}
@@ -259,99 +271,88 @@ func createOptimizedHTTPClient(timeoutSeconds int) *http.Client {
 	}
 }
 
-// Authenticate user with NetExplorer and store token
-func (ne *NetExplorer) Authenticate(email, password string) (string, error) {
-	fs.Debugf(nil, "Authenticate: POST /api/auth as %q", email)
-
-	payload := map[string]string{"user": email, "password": password}
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return "", err
+func oauthEndpointsFromBaseURL(baseURL string) (authURL string, tokenURL string, err error) {
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", "", fmt.Errorf("invalid base_url %q for OAuth2 endpoints", baseURL)
 	}
-	req, err := http.NewRequest("POST", ne.BaseURL+"/api/auth", bytes.NewBuffer(b))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	start := time.Now()
-	resp, err := ne.Client.Do(req)
-	dt := time.Since(start)
-	if err != nil {
-		fs.Debugf(nil, "Authenticate: HTTP error after %v: %v", dt, err)
-		return "", err
-	}
-	defer resp.Body.Close()
-	fs.Debugf(nil, "Authenticate: status=%d in %v", resp.StatusCode, dt)
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("authentication failed: %d %s", resp.StatusCode, body)
-	}
-
-	var result struct {
-		Token string `json:"token"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
-	}
-	ne.Token = result.Token
-	// Save token under the configured rclone remote section so external
-	// processes updating the rclone config can be detected. Fall back to
-	// ClientID for backward compatibility if ConfigName was not set.
-	cfgKey := ne.ConfigName
-	if cfgKey == "" {
-		cfgKey = ne.ClientID
-	}
-	if err := config.SetValueAndSave(cfgKey, "token", ne.Token); err != nil {
-		return ne.Token, fmt.Errorf("authentication succeeded but failed to save token: %w", err)
-	}
-	fs.Debugf(nil, "Authenticate: token saved for config %q", cfgKey)
-	return result.Token, nil
+	return u.Scheme + "://" + u.Host + "/oauth2/authorize", u.Scheme + "://" + u.Host + "/oauth2/token", nil
 }
 
-// doRequestWithReauth executes a request built by buildReq using the current token.
-// It proactively checks the config file for token updates before each request to
-// seamlessly pick up tokens refreshed by NetExplorer Import's background loop.
-// If the server responds with HTTP 401 Unauthorized, it will normally wait briefly and
-// re-read the token from the config. If that yields a different token, it will
-// retry once with the new token. If the token did not change, it will then try
-// to re-authenticate once using the configured email/password, update the stored
-// token and retry the request a final time.
-// If directReauth is true, a 401 will skip the external-refresh wait and go
-// directly to the credential-based re-authentication.
-func (ne *NetExplorer) doRequestWithReauth(buildReq func(token string) (*http.Request, error), directReauth bool) (*http.Response, error) {
-	// Helper to build and execute the HTTP request
-	do := func(token string) (*http.Response, error) {
-		req, err := buildReq(token)
+func getDefaultOAuthClientSecret() (string, error) {
+	if rcloneEncryptedClientSecret == "" {
+		return "", nil
+	}
+	secret, err := obscure.Reveal(rcloneEncryptedClientSecret)
+	if err != nil {
+		return "", fmt.Errorf("invalid built-in netexplorer client secret: %w", err)
+	}
+	return secret, nil
+}
+
+func getOAuthConfig(m configmap.Mapper) (*oauthutil.Config, error) {
+	baseURL, ok := m.Get("base_url")
+	if !ok || baseURL == "" {
+		baseURL = defaultBaseURL
+	}
+	authURL, tokenURL, err := oauthEndpointsFromBaseURL(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	clientSecret, err := getDefaultOAuthClientSecret()
+	if err != nil {
+		return nil, err
+	}
+	return &oauthutil.Config{
+		AuthURL:      authURL,
+		TokenURL:     tokenURL,
+		ClientID:     rcloneClientID,
+		ClientSecret: clientSecret,
+		AuthStyle:    oauth2.AuthStyleInParams,
+		Scopes:       []string{"all"},
+		RedirectURL:  oauthutil.RedirectLocalhostURL,
+	}, nil
+}
+
+// normalizeLegacyToken supports old NetExplorer configs that stored a raw access token string.
+func normalizeLegacyToken(m configmap.Mapper) error {
+	tokenString, ok := m.Get(config.ConfigToken)
+	if !ok || tokenString == "" || json.Valid([]byte(tokenString)) {
+		return nil
+	}
+	tokenBytes, err := json.Marshal(&oauth2.Token{
+		AccessToken: tokenString,
+		TokenType:   "Bearer",
+	})
+	if err != nil {
+		return err
+	}
+	m.Set(config.ConfigToken, string(tokenBytes))
+	return nil
+}
+
+// doRequestWithReauth executes an API request with the current OAuth2 access token.
+//
+// On HTTP 401 it invalidates the token once and retries one time.
+func (ne *NetExplorer) doRequestWithReauth(buildReq func(token string) (*http.Request, error), _ bool) (*http.Response, error) {
+	if ne.tokenSource == nil {
+		return nil, errors.New("netexplorer: OAuth2 token source is not configured")
+	}
+
+	do := func() (*http.Response, error) {
+		token, err := ne.tokenSource.Token()
+		if err != nil {
+			return nil, fmt.Errorf("netexplorer: failed to get OAuth2 token: %w", err)
+		}
+		ne.Token = token.AccessToken
+		req, err := buildReq(ne.Token)
 		if err != nil {
 			return nil, err
 		}
 		return ne.Client.Do(req)
 	}
 
-	// Merge per-call flag with configuration: either an explicit true or the
-	// backend option will enable direct re-authentication.
-	effectiveDirectReauth := directReauth
-	if !effectiveDirectReauth && ne.opt != nil && ne.opt.DirectReauth {
-		effectiveDirectReauth = true
-	}
-
-	// PROACTIVE: Re-read token from config before each request to pick up
-	// external refreshes (e.g., from NetExplorer Import's 60s refresh loop).
-	// This ensures long-running transfers seamlessly use refreshed tokens.
-	cfgKey := ne.ConfigName
-	if cfgKey == "" {
-		cfgKey = ne.ClientID
-	}
-	currentTokenFromConfig := config.GetValue(cfgKey, "token")
-	if currentTokenFromConfig != "" && currentTokenFromConfig != ne.Token {
-		fs.Debugf(nil, "netexplorer: detected token refresh in config (proactive check), updating in-memory token for config %q", cfgKey)
-		ne.Token = currentTokenFromConfig
-	}
-
-	// First attempt with current token (may have just been refreshed above)
-	resp, err := do(ne.Token)
+	resp, err := do()
 	if err != nil {
 		return nil, err
 	}
@@ -359,70 +360,11 @@ func (ne *NetExplorer) doRequestWithReauth(buildReq func(token string) (*http.Re
 		return resp, nil
 	}
 
-	// Token is missing or no longer valid - see NetExplorer docs (401 Unauthorized).
-	resp.Body.Close()
-
-	if !effectiveDirectReauth {
-		// Log tokens found in both possible config locations to help diagnose
-		// where an external refresher may have written the new token.
-		mask := func(t string) string {
-			if t == "" {
-				return "(empty)"
-			}
-			if len(t) <= 8 {
-				return t
-			}
-			return t[:4] + "…" + t[len(t)-4:]
-		}
-		altToken := config.GetValue(ne.ClientID, "token")
-		fs.Debugf(nil, "netexplorer: 401 detected, current in-memory token=%s config[%s]=%s config[%s]=%s", mask(ne.Token), cfgKey, mask(currentTokenFromConfig), ne.ClientID, mask(altToken))
-
-		const waitForExternalRefresh = 10 * time.Second
-		fs.Debugf(nil, "netexplorer: got 401, waiting %v to see if token is refreshed externally", waitForExternalRefresh)
-		time.Sleep(waitForExternalRefresh)
-		// Force reload of the config file from disk in case an external
-		// process updated it while we were waiting.
-		if Loaded := config.LoadedData(); Loaded != nil {
-			if err := Loaded.Load(); err != nil {
-				fs.Debugf(nil, "netexplorer: failed to reload config after 401: %v", err)
-			} else {
-				fs.Debugf(nil, "netexplorer: reloaded config from disk after 401")
-			}
-		}
-
-		// Re-read token from both config keys; prefer a changed value found in
-		// either the remote-named section or the original ClientID section.
-		newTokenFromCfgKey := config.GetValue(cfgKey, "token")
-		newTokenFromClientID := config.GetValue(ne.ClientID, "token")
-		if newTokenFromCfgKey != "" && newTokenFromCfgKey != ne.Token {
-			fs.Debugf(nil, "netexplorer: detected new token in config %q after 401; retrying request with refreshed token", cfgKey)
-			ne.Token = newTokenFromCfgKey
-			return do(ne.Token)
-		}
-		if newTokenFromClientID != "" && newTokenFromClientID != ne.Token {
-			fs.Debugf(nil, "netexplorer: detected new token in config %q after 401; retrying request with refreshed token", ne.ClientID)
-			ne.Token = newTokenFromClientID
-			return do(ne.Token)
-		}
+	if resp.Body != nil {
+		_ = resp.Body.Close()
 	}
-
-	// No external refresh detected - or directReauth was requested - try to re-authenticate once if we have
-	// credentials configured.
-	if ne.opt == nil || ne.opt.Email == "" || ne.opt.Password == "" {
-		return nil, fmt.Errorf("netexplorer: token expired (401) and no credentials configured for automatic re-authentication")
-	}
-
-	fs.Debugf(nil, "netexplorer: token appears expired (401), re-authenticating as %q", ne.opt.Email)
-
-	newTok, err := ne.Authenticate(ne.opt.Email, ne.opt.Password)
-	if err != nil {
-		return nil, fmt.Errorf("netexplorer: token expired (401) and re-authentication failed: %w", err)
-	}
-	ne.Token = newTok
-
-	// Retry once with the fresh token. If this still fails (including 401),
-	// return the response/error to the caller.
-	return do(ne.Token)
+	ne.tokenSource.Invalidate()
+	return do()
 }
 
 // Registration options
@@ -431,33 +373,23 @@ func init() {
 		Name:        "netexplorer",
 		Description: "NetExplorer remote",
 		NewFs:       NewFs,
-		Options: []fs.Option{
+		Config: func(ctx context.Context, name string, m configmap.Mapper, config fs.ConfigIn) (*fs.ConfigOut, error) {
+			oAuthConfig, err := getOAuthConfig(m)
+			if err != nil {
+				return nil, err
+			}
+			return oauthutil.ConfigOut("", &oauthutil.Options{
+				OAuth2Config: oAuthConfig,
+				NoOffline:    true,
+			})
+		},
+		Options: append([]fs.Option{
 			{
 				Name:    "base_url",
 				Help:    "Base URL of the NetExplorer API",
-				Default: "https://org.netexplorer.pro",
+				Default: defaultBaseURL,
 			},
-			{
-				Name:      "token",
-				Help:      "Access token for NetExplorer",
-				Default:   "",
-				Advanced:  true,
-				Sensitive: true,
-			},
-			{
-				Name:      "email",
-				Help:      "Your NetExplorer user email (used to fetch a token if you don't paste one)",
-				Default:   "",
-				Sensitive: true,
-			},
-			{
-				Name:       "password",
-				Help:       "Your NetExplorer password (used to fetch a token if you don't paste one)",
-				Default:    "",
-				IsPassword: true,
-				NoPasswordGenerate: true,
-				Required:   true,
-			},
+		}, append(oauthutil.SharedOptions, []fs.Option{
 			{
 				Name:     "root",
 				Help:     "Numeric root folder ID",
@@ -524,23 +456,13 @@ func init() {
 				Default:  1,
 				Advanced: true,
 			},
-			{
-				Name:     "direct_reauth",
-				Help:     "On HTTP 401, skip waiting for external token refresh and re-authenticate immediately using configured credentials",
-				Default:  false,
-				Advanced: true,
-			},
-		},
+		}...)...),
 	})
 }
 
 // Options is how rclone config is mapped into your backend
 type Options struct {
 	BaseURL              string `config:"base_url"`
-	ClientID             string `config:"client_id"`
-	Token                string `config:"token"`
-	Email                string `config:"email"`
-	Password             string `config:"password"`
 	Root                 string `config:"root"`
 	IndexPath            string `config:"index_path"`
 	MaxConcurrency       int    `config:"max_concurrency"`
@@ -552,7 +474,6 @@ type Options struct {
 	DisableHashCheck     bool   `config:"disable_hash_check"`
 	UploadRetries        int    `config:"upload_retries"`
 	RetryDelayBase       int    `config:"retry_delay_base"`
-	DirectReauth         bool   `config:"direct_reauth"`
 }
 
 // UploadCache stores upload responses to avoid redundant lookups
@@ -1220,16 +1141,18 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, err
 	}
 
-	// Password values are stored obscured in the config file.
-	// Reveal it for authentication use, but also tolerate plain text values.
-	if opt.Password != "" {
-		revealed, err := obscure.Reveal(opt.Password)
-		if err == nil {
-			opt.Password = revealed
-		}
+	if opt.BaseURL == "" {
+		opt.BaseURL = defaultBaseURL
+	}
+	if err := normalizeLegacyToken(m); err != nil {
+		return nil, fmt.Errorf("failed to normalize legacy token: %w", err)
+	}
+	oAuthConfig, err := getOAuthConfig(m)
+	if err != nil {
+		return nil, fmt.Errorf("invalid OAuth2 config: %w", err)
 	}
 
-	fs.Debugf(nil, "NewFs(name=%q, root=%q) base_url=%q client_id=%q", name, root, opt.BaseURL, opt.ClientID)
+	fs.Debugf(nil, "NewFs(name=%q, root=%q) base_url=%q", name, root, opt.BaseURL)
 
 	// Set defaults for new options
 	if opt.MaxConcurrency <= 0 {
@@ -1245,27 +1168,18 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt.FolderDelay = 50
 	}
 
-	// Create API client with optimized HTTP client
-	ne := &NetExplorer{
-		BaseURL:  opt.BaseURL,
-		Token:    opt.Token,
-		ClientID: opt.ClientID,
-		// Store the rclone remote name so token lookups use the same
-		// config section other processes write to.
-		ConfigName: name,
-		Client:     createOptimizedHTTPClient(opt.RequestTimeout),
-		opt:        opt,
+	baseClient := createOptimizedHTTPClient(opt.RequestTimeout)
+	_, tokenSource, err := oauthutil.NewClientWithBaseClient(ctx, name, m, oAuthConfig, baseClient)
+	if err != nil {
+		return nil, fmt.Errorf("failed to configure netexplorer oauth2: %w", err)
 	}
 
-	// Fetch token if needed
-	if opt.Token == "" && opt.Email != "" && opt.Password != "" {
-		fs.Debugf(nil, "NewFs: no token, authenticating as %q …", opt.Email)
-		tok, err := ne.Authenticate(opt.Email, opt.Password)
-		if err != nil {
-			return nil, fmt.Errorf("failed to login to NetExplorer: %w", err)
-		}
-		opt.Token = tok
-		ne.Token = tok
+	// Create API client with optimized HTTP client
+	ne := &NetExplorer{
+		BaseURL:     opt.BaseURL,
+		Client:      baseClient,
+		tokenSource: tokenSource,
+		opt:         opt,
 	}
 	u, _ := url.Parse(ne.BaseURL)
 	if _, err := net.LookupHost(u.Hostname()); err != nil {
