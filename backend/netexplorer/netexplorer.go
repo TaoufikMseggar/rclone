@@ -33,6 +33,7 @@ import (
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/config/obscure"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/oauthutil"
 	"go.etcd.io/bbolt"
@@ -43,17 +44,17 @@ import (
 var netExplorerForbiddenNameChars = regexp.MustCompile(`[\\/:*?"<>|]`)
 
 const (
-	defaultBaseURL = "https://org.netexplorer.pro"
-	//rcloneClientID              = "ig02bVi19GPWyaAn6S60i2MelF1g29IrCA5NqRYvCr8"
-	//rcloneEncryptedClientSecret = "XJUaxXVsjnDH7V2ESPlHPagg5BLDEWTqQjRzmKyOhbxcg0OFZz_2k6YWTzzvEeMKxgMTYWa1WrIYnvA"
+	defaultBaseURL              = "https://org.netexplorer.pro"
+	rcloneClientID              = "ig02bVi19GPWyaAn6S60i2MelF1g29IrCA5NqRYvCr8"
+	rcloneEncryptedClientSecret = "XJUaxXVsjnDH7V2ESPlHPagg5BLDEWTqQjRzmKyOhbxcg0OFZz_2k6YWTzzvEeMKxgMTYWa1WrIYnvA"
 
 	// TEST JOHAN
 	//rcloneClientID              = "FdjdTmAuHMK5q9xio-n7RiI3mVZZDhN-I8VI4bYy_60"
 	//rcloneEncryptedClientSecret = "dREEbXK8AGbIXs8N8B9VQ3djIxilorZv0DB1ZwgZGOndow0BBXjdfDrjfL3npLyax2MMhrqF6xus150"
 
 	// TEST NE-PREPROD
-	rcloneClientID              = "1hDBH_cgxYKmvtX0hFU5yDQEKRygqhOJrkf00a3uQt6"
-	rcloneEncryptedClientSecret = "5VflbKiuQnGwpZAjaCfHWoTySRxTXMCC5UZJLpUTVU8vYjGYNaRifepBEbLupu-AXwxQrQC32r3x66c"
+	//rcloneClientID              = "1hDBH_cgxYKmvtX0hFU5yDQEKRygqhOJrkf00a3uQt6"
+	//rcloneEncryptedClientSecret = "5VflbKiuQnGwpZAjaCfHWoTySRxTXMCC5UZJLpUTVU8vYjGYNaRifepBEbLupu-AXwxQrQC32r3x66c"
 )
 
 // NetExplorer is the API client
@@ -655,7 +656,10 @@ func (f *Fs) getCachedFolderMetadata(folderID string) (*APIFolder, bool) {
 
 // smartHydrateFile uses exponential backoff and limited retries for file hydration
 func (f *Fs) smartHydrateFile(ctx context.Context, parentID, filename, dir string) int {
-	maxRetries := 3 // Reduced from 5 to 3 for better performance
+	maxRetries := f.opt.HydrationRetries
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
 	baseDelay := 1 * time.Second
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -2595,7 +2599,8 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 					if seeker, ok := in.(io.Seeker); ok {
 						seeker.Seek(0, io.SeekStart)
 					} else {
-						return fmt.Errorf("cannot retry upload - reader is not seekable: %w", err)
+						// Let the higher-level retry reopen a fresh source reader.
+						return fserrors.RetryError(fmt.Errorf("cannot retry in-place upload - reader is not seekable: %w", err))
 					}
 					continue
 				} else {
@@ -3175,53 +3180,123 @@ func (ne *NetExplorer) UploadFile(folderID, fileName string, data io.Reader, fil
 	return ne.uploadChunked(folderID, fileName, data, fileSize, chunkSize, modTime, createdTime)
 }
 
+// parseChunkReportMissing parses a chunk upload report response and returns
+// the next missing chunk index when present.
+func parseChunkReportMissing(body []byte) (missing int, ok bool) {
+	type reportEntry struct {
+		Missing int `json:"missing"`
+	}
+	var report []reportEntry
+	if err := json.Unmarshal(body, &report); err != nil || len(report) == 0 {
+		return 0, false
+	}
+	if report[0].Missing < 0 {
+		return 0, false
+	}
+	return report[0].Missing, true
+}
+
 // --- helper for chunked uploads ---------------------------------------------
 
-// uploadChunked handles chunked uploads for files that are too large for direct upload
+// uploadChunked handles chunked uploads for files that are too large for direct upload.
 func (ne *NetExplorer) uploadChunked(folderID, fileName string, data io.Reader, fileSize int64, chunkSize int64, modTime time.Time, createdTime time.Time) (*APIFile, error) {
 	totalChunks := int((fileSize + chunkSize - 1) / chunkSize)
 	lastChunkIdx := totalChunks - 1
 
-	// Optimized sequential chunk upload - NetExplorer API doesn't support parallel chunks
-	buf := make([]byte, chunkSize)
-	chunkRetries := make(map[int]int) // Track retries per chunk
+	// Double buffers for read-ahead pipelining
+	bufs := [2][]byte{make([]byte, chunkSize), make([]byte, chunkSize)}
+
+	chunkRetries := make(map[int]int)
+	var finalInfo *APIFile
+
+	// Read-ahead state: a goroutine reads the next chunk while the current one uploads.
+	type readAheadResult struct{ err error }
+	var pendingRead chan readAheadResult
+	pendingReadIdx := -1
+
+	// drainReadAhead waits for any in-flight read-ahead goroutine to finish.
+	// Must be called before seeking or re-reading from data.
+	drainReadAhead := func() {
+		if pendingRead != nil {
+			<-pendingRead
+			pendingRead = nil
+			pendingReadIdx = -1
+		}
+	}
+
+	// skipRead: when true, the current chunk's data is already in curBuf
+	// from the previous attempt – skip reading and read-ahead start.
+	skipRead := false
+
 	for idx := 0; idx < totalChunks; idx++ {
+		curBuf := bufs[idx%2]
 		need := int(chunkSize)
 		if rem := fileSize - int64(idx)*chunkSize; rem < chunkSize {
 			need = int(rem)
 		}
 
-		if _, err := io.ReadFull(data, buf[:need]); err != nil {
-			fs.Debugf(nil, "uploadChunked(%q): read chunk %d error: %v", fileName, idx, err)
-			return nil, fmt.Errorf("read chunk %d: %w", idx, err)
+		// ── Get chunk data: from read-ahead, direct read, or reuse (skipRead) ──
+		if skipRead {
+			// Data is already in curBuf from the previous attempt.
+			skipRead = false
+		} else if pendingRead != nil && pendingReadIdx == idx {
+			res := <-pendingRead
+			pendingRead = nil
+			pendingReadIdx = -1
+			if res.err != nil {
+				fs.Debugf(nil, "uploadChunked(%q): read-ahead chunk %d error: %v", fileName, idx, res.err)
+				return nil, fmt.Errorf("read chunk %d: %w", idx, res.err)
+			}
+		} else {
+			if _, err := io.ReadFull(data, curBuf[:need]); err != nil {
+				fs.Debugf(nil, "uploadChunked(%q): read chunk %d error: %v", fileName, idx, err)
+				return nil, fmt.Errorf("read chunk %d: %w", idx, err)
+			}
 		}
 
-		// Optimized multipart creation
-		var body bytes.Buffer
-		w := multipart.NewWriter(&body)
+		// ── Start read-ahead for next chunk (skip if we are retrying) ──
+		if idx < lastChunkIdx && pendingRead == nil {
+			nextBuf := bufs[(idx+1)%2]
+			nextNeed := int(chunkSize)
+			if rem := fileSize - int64(idx+1)*chunkSize; rem < chunkSize {
+				nextNeed = int(rem)
+			}
+			ch := make(chan readAheadResult, 1)
+			pendingRead = ch
+			pendingReadIdx = idx + 1
+			go func(buf []byte, n int) {
+				_, err := io.ReadFull(data, buf[:n])
+				ch <- readAheadResult{err}
+			}(nextBuf, nextNeed)
+		}
 
-		// Track form fields for logging
+		// ── Build streaming multipart body ──
+		// Write fields + file-part header into a small buffer, then stream the
+		// chunk data via io.MultiReader to avoid copying it.
+		var hdr bytes.Buffer
+		mw := multipart.NewWriter(&hdr)
+
 		formFields := map[string]string{
 			"folderId":   folderID,
 			"chunk":      strconv.Itoa(idx),
 			"chunks":     strconv.Itoa(totalChunks),
 			"chunksSize": strconv.FormatInt(chunkSize, 10),
 			"fileSize":   strconv.FormatInt(fileSize, 10),
+			"report":     "1",
 		}
 
-		_ = w.WriteField("folderId", folderID)
-		_ = w.WriteField("chunk", strconv.Itoa(idx))
-		_ = w.WriteField("chunks", strconv.Itoa(totalChunks))
-		_ = w.WriteField("chunksSize", strconv.FormatInt(chunkSize, 10))
-		_ = w.WriteField("fileSize", strconv.FormatInt(fileSize, 10))
+		_ = mw.WriteField("folderId", folderID)
+		_ = mw.WriteField("chunk", strconv.Itoa(idx))
+		_ = mw.WriteField("chunks", strconv.Itoa(totalChunks))
+		_ = mw.WriteField("chunksSize", strconv.FormatInt(chunkSize, 10))
+		_ = mw.WriteField("fileSize", strconv.FormatInt(fileSize, 10))
+		_ = mw.WriteField("report", "1")
 
 		// Add dates on the first chunk AND the last chunk
-		// Some APIs may read dates from the last chunk where the final file metadata is returned
 		if idx == 0 || idx == lastChunkIdx {
 			if !modTime.IsZero() {
-				modTimeUTC := modTime.UTC()
-				modTimeStr := modTimeUTC.Format(time.RFC3339)
-				_ = w.WriteField("modification", modTimeStr)
+				modTimeStr := modTime.UTC().Format(time.RFC3339)
+				_ = mw.WriteField("modification", modTimeStr)
 				formFields["modification"] = modTimeStr
 				if idx == 0 {
 					fs.Debugf(nil, "uploadChunked(%q): chunk %d adding modification=%q (UTC)", fileName, idx, modTimeStr)
@@ -3232,9 +3307,8 @@ func (ne *NetExplorer) uploadChunked(folderID, fileName string, data io.Reader, 
 				fs.Debugf(nil, "uploadChunked(%q): chunk %d modTime is zero, not sending modification field", fileName, idx)
 			}
 			if !createdTime.IsZero() {
-				createdTimeUTC := createdTime.UTC()
-				createdTimeStr := createdTimeUTC.Format(time.RFC3339)
-				_ = w.WriteField("creation", createdTimeStr)
+				createdTimeStr := createdTime.UTC().Format(time.RFC3339)
+				_ = mw.WriteField("creation", createdTimeStr)
 				formFields["creation"] = createdTimeStr
 				if idx == 0 {
 					fs.Debugf(nil, "uploadChunked(%q): chunk %d adding creation=%q (UTC)", fileName, idx, createdTimeStr)
@@ -3244,145 +3318,144 @@ func (ne *NetExplorer) uploadChunked(folderID, fileName string, data io.Reader, 
 			} else {
 				fs.Debugf(nil, "uploadChunked(%q): chunk %d createdTime is zero, not sending creation field", fileName, idx)
 			}
-		}
-		// Log request form fields for chunks with dates (first and last)
-		if idx == 0 || idx == lastChunkIdx {
 			fs.Debugf(nil, "uploadChunked(%q): chunk %d request form fields: %v", fileName, idx, formFields)
 		}
 
-		part, _ := w.CreateFormFile("targetFile", fileName)
-		_, _ = part.Write(buf[:need])
-		_ = w.Close()
+		// Write the file-part header (boundary + Content-Disposition) but NOT the data.
+		_, _ = mw.CreateFormFile("targetFile", fileName)
+		contentType := mw.FormDataContentType()
+		closingBoundary := fmt.Sprintf("\r\n--%s--\r\n", mw.Boundary())
 
+		// Capture header bytes; these are small (~500 bytes).
+		hdrBytes := hdr.Bytes()
+		bodySize := int64(len(hdrBytes)) + int64(need) + int64(len(closingBoundary))
+
+		// ── Upload chunk (streaming) ──
 		start := time.Now()
 		resp, err := ne.doRequestWithReauth(func(token string) (*http.Request, error) {
-			req, err := http.NewRequest("POST", ne.BaseURL+"/api/file/upload", &body)
+			// Reconstruct fresh readers for each attempt (reauth may retry).
+			body := io.MultiReader(
+				bytes.NewReader(hdrBytes),
+				bytes.NewReader(curBuf[:need]),
+				strings.NewReader(closingBoundary),
+			)
+			req, err := http.NewRequest("POST", ne.BaseURL+"/api/file/upload?full=1", body)
 			if err != nil {
 				return nil, err
 			}
+			req.ContentLength = bodySize
 			req.Header.Set("Authorization", "Bearer "+token)
-			req.Header.Set("Content-Type", w.FormDataContentType())
+			req.Header.Set("Content-Type", contentType)
 			return req, nil
 		}, false)
 		dt := time.Since(start)
+
+		// ── Handle HTTP errors ──
 		if err != nil {
 			fs.Debugf(nil, "uploadChunked(%q): HTTP error on chunk %d after %v: %v", fileName, idx, dt, err)
 
-			// Handle network errors for chunks
+			retryable := false
+			delay := 2 * time.Second
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				fs.Debugf(nil, "uploadChunked(%q): chunk %d network timeout, retrying", fileName, idx)
-				// Rewind the data reader to the start of this chunk for retry
-				if seeker, ok := data.(io.Seeker); ok {
-					offset := int64(idx) * chunkSize
-					if _, seekErr := seeker.Seek(offset, io.SeekStart); seekErr != nil {
-						fs.Debugf(nil, "uploadChunked(%q): failed to seek for retry of chunk %d: %v", fileName, idx, seekErr)
-						return nil, fmt.Errorf("seek for retry of chunk %d: %w", idx, seekErr)
-					}
-				}
-				idx-- // Retry this chunk
-				time.Sleep(2 * time.Second)
-				continue
-			}
-
-			// Handle connection resets for chunks
-			if strings.Contains(err.Error(), "connection reset") || strings.Contains(err.Error(), "broken pipe") {
+				retryable = true
+			} else if strings.Contains(err.Error(), "connection reset") || strings.Contains(err.Error(), "broken pipe") {
 				fs.Debugf(nil, "uploadChunked(%q): chunk %d connection reset, retrying", fileName, idx)
-				// Rewind the data reader to the start of this chunk for retry
-				if seeker, ok := data.(io.Seeker); ok {
-					offset := int64(idx) * chunkSize
-					if _, seekErr := seeker.Seek(offset, io.SeekStart); seekErr != nil {
-						fs.Debugf(nil, "uploadChunked(%q): failed to seek for retry of chunk %d: %v", fileName, idx, seekErr)
-						return nil, fmt.Errorf("seek for retry of chunk %d: %w", idx, seekErr)
-					}
-				}
-				idx-- // Retry this chunk
-				time.Sleep(3 * time.Second)
+				retryable = true
+				delay = 3 * time.Second
+			}
+			if retryable {
+				drainReadAhead()
+				skipRead = true
+				idx--
+				time.Sleep(delay)
 				continue
 			}
-
 			return nil, err
 		}
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
 
-		if len(bodyBytes) > 0 && (resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK) {
-			fs.Debugf(nil, "uploadChunked(%q): chunk %d server response body: %s", fileName, idx, string(bodyBytes))
-			// Parse response on last chunk to check if dates were applied
+		// ── Read & process response ──
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		isSuccess := resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK
+		if len(respBody) > 0 && isSuccess {
+			fs.Debugf(nil, "uploadChunked(%q): chunk %d server response body: %s", fileName, idx, string(respBody))
+		} else if !isSuccess {
+			fs.Debugf(nil, "uploadChunked(%q): chunk %d error response body: %s", fileName, idx, string(respBody))
+		}
+
+		if isSuccess {
+			if missing, ok := parseChunkReportMissing(respBody); ok && missing <= idx {
+				fs.Debugf(nil, "uploadChunked(%q): server reports missing chunk %d while sending chunk %d – cannot rewind non-seekable reader, aborting", fileName, missing, idx)
+				drainReadAhead()
+				return nil, fmt.Errorf("server reports missing chunk %d but reader is not seekable", missing)
+			}
+
 			if idx == lastChunkIdx {
 				var fi APIFile
-				if err := json.Unmarshal(bodyBytes, &fi); err == nil && fi.ID != 0 {
+				if err := json.Unmarshal(respBody, &fi); err == nil && fi.ID != 0 {
+					if fi.MD5 == "" && fi.Hash != "" {
+						fi.MD5 = fi.Hash
+					}
+					finalInfo = &fi
 					fs.Debugf(nil, "uploadChunked(%q): last chunk %d parsed response - id=%d creation=%v modification=%v", fileName, idx, fi.ID, fi.Creation, fi.Modification)
 					fs.Debugf(nil, "uploadChunked(%q): expected dates - creation=%v modification=%v", fileName, createdTime.UTC(), modTime.UTC())
 				}
 			}
-		} else if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-			fs.Debugf(nil, "uploadChunked(%q): chunk %d error response body: %s", fileName, idx, string(bodyBytes))
 		}
 
-		if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-			// Enhanced error handling for chunk failures
+		if !isSuccess {
+			retryChunk := func(delay time.Duration) {
+				drainReadAhead()
+				skipRead = true
+				time.Sleep(delay)
+			}
+
 			switch resp.StatusCode {
 			case 400:
-				// Bad request - retry the chunk
 				fs.Debugf(nil, "uploadChunked(%q): chunk %d failed with 400, retrying", fileName, idx)
-				// Rewind the data reader to the start of this chunk for retry
-				if seeker, ok := data.(io.Seeker); ok {
-					offset := int64(idx) * chunkSize
-					if _, seekErr := seeker.Seek(offset, io.SeekStart); seekErr != nil {
-						fs.Debugf(nil, "uploadChunked(%q): failed to seek for retry of chunk %d: %v", fileName, idx, seekErr)
-						return nil, fmt.Errorf("seek for retry of chunk %d: %w", idx, seekErr)
+				retryChunk(0)
+				idx--
+				continue
+			case 404:
+				chunkRetries[idx]++
+				maxChunkRetries := 3
+				if chunkRetries[idx] > maxChunkRetries {
+					return nil, &httpErr{
+						code: resp.StatusCode,
+						body: fmt.Sprintf("chunk %d failed after %d retries", idx, maxChunkRetries),
 					}
 				}
-				// Retry this chunk
-				idx-- // Decrement to retry this chunk
+				delay := time.Duration(chunkRetries[idx]) * time.Second
+				fs.Debugf(nil, "uploadChunked(%q): chunk %d got 404, waiting %v (retry %d/%d)", fileName, idx, delay, chunkRetries[idx], maxChunkRetries)
+				retryChunk(delay)
+				idx--
 				continue
 			case 423:
-				// File still being transferred - we need to retry this chunk to ensure it was uploaded
-				// 423 can mean the chunk is still being processed OR the chunk upload failed
 				chunkRetries[idx]++
 				maxChunkRetries := 3
 				if chunkRetries[idx] > maxChunkRetries {
 					fs.Debugf(nil, "uploadChunked(%q): chunk %d got 423 after %d retries - treating as successful", fileName, idx, maxChunkRetries)
-					// After max retries, treat as successful to avoid infinite loops
 					continue
 				}
+				delay := time.Duration(chunkRetries[idx]) * 2 * time.Second
 				fs.Debugf(nil, "uploadChunked(%q): chunk %d got 423 - retry %d/%d", fileName, idx, chunkRetries[idx], maxChunkRetries)
-				// Wait a bit before retrying
-				time.Sleep(time.Duration(chunkRetries[idx]) * 2 * time.Second)
-				// Rewind the data reader to the start of this chunk for retry
-				if seeker, ok := data.(io.Seeker); ok {
-					offset := int64(idx) * chunkSize
-					if _, seekErr := seeker.Seek(offset, io.SeekStart); seekErr != nil {
-						fs.Debugf(nil, "uploadChunked(%q): failed to seek for retry of chunk %d: %v", fileName, idx, seekErr)
-						return nil, fmt.Errorf("seek for retry of chunk %d: %w", idx, seekErr)
-					}
-				}
-				// Retry this chunk
-				idx-- // Decrement to retry this chunk
+				retryChunk(delay)
+				idx--
 				continue
 			case 429:
-				// Rate limiting - retry with exponential backoff
 				chunkRetries[idx]++
-				maxChunkRetries := 5 // Increased from 3 to 5
+				maxChunkRetries := 5
 				if chunkRetries[idx] > maxChunkRetries {
 					fs.Debugf(nil, "uploadChunked(%q): chunk %d rate limited after %d retries - treating as successful", fileName, idx, maxChunkRetries)
 					continue
 				}
 				delay := time.Duration(chunkRetries[idx]) * 3 * time.Second
 				fs.Debugf(nil, "uploadChunked(%q): chunk %d rate limited (429), waiting %v (retry %d/%d)", fileName, idx, delay, chunkRetries[idx], maxChunkRetries)
-				time.Sleep(delay)
-				// Rewind the data reader to the start of this chunk for retry
-				if seeker, ok := data.(io.Seeker); ok {
-					offset := int64(idx) * chunkSize
-					if _, seekErr := seeker.Seek(offset, io.SeekStart); seekErr != nil {
-						fs.Debugf(nil, "uploadChunked(%q): failed to seek for retry of chunk %d: %v", fileName, idx, seekErr)
-						return nil, fmt.Errorf("seek for retry of chunk %d: %w", idx, seekErr)
-					}
-				}
-				idx-- // Retry this chunk
+				retryChunk(delay)
+				idx--
 				continue
 			case 500:
-				// Server error - wait longer and retry with exponential backoff
 				chunkRetries[idx]++
 				maxChunkRetries := 3
 				if chunkRetries[idx] > maxChunkRetries {
@@ -3391,19 +3464,10 @@ func (ne *NetExplorer) uploadChunked(folderID, fileName string, data io.Reader, 
 				}
 				delay := time.Duration(chunkRetries[idx]) * 5 * time.Second
 				fs.Debugf(nil, "uploadChunked(%q): chunk %d got 500, waiting %v (retry %d/%d)", fileName, idx, delay, chunkRetries[idx], maxChunkRetries)
-				time.Sleep(delay)
-				// Rewind the data reader to the start of this chunk for retry
-				if seeker, ok := data.(io.Seeker); ok {
-					offset := int64(idx) * chunkSize
-					if _, seekErr := seeker.Seek(offset, io.SeekStart); seekErr != nil {
-						fs.Debugf(nil, "uploadChunked(%q): failed to seek for retry of chunk %d: %v", fileName, idx, seekErr)
-						return nil, fmt.Errorf("seek for retry of chunk %d: %w", idx, seekErr)
-					}
-				}
-				idx-- // Retry this chunk
+				retryChunk(delay)
+				idx--
 				continue
 			default:
-				// Other errors - wrap and return
 				return nil, &httpErr{
 					code: resp.StatusCode,
 					body: fmt.Sprintf("chunk %d failed", idx),
@@ -3411,7 +3475,8 @@ func (ne *NetExplorer) uploadChunked(folderID, fileName string, data io.Reader, 
 			}
 		}
 	}
-	return nil, nil
+	drainReadAhead()
+	return finalInfo, nil
 }
 
 // --- helper for small uploads ---------------------------------------------
