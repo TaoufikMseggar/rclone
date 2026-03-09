@@ -280,6 +280,20 @@ func oauthEndpointsFromBaseURL(baseURL string) (authURL string, tokenURL string,
 	return u.Scheme + "://" + u.Host + "/oauth2/authorize", u.Scheme + "://" + u.Host + "/oauth2/token", nil
 }
 
+func closeResponseBody(resp *http.Response) {
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+}
+
+func drainAndCloseResponseBody(resp *http.Response) {
+	if resp == nil || resp.Body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+}
+
 func getDefaultOAuthClientSecret() (string, error) {
 	if rcloneEncryptedClientSecret == "" {
 		return "", nil
@@ -361,9 +375,7 @@ func (ne *NetExplorer) doRequestWithReauth(buildReq func(token string) (*http.Re
 		return resp, nil
 	}
 
-	if resp.Body != nil {
-		_ = resp.Body.Close()
-	}
+	closeResponseBody(resp)
 	ne.tokenSource.Invalidate()
 	return do()
 }
@@ -1441,16 +1453,24 @@ func (f *Fs) ensureRoot(ctx context.Context) error {
 
 	// 2) Print them in aligned columns
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tName")
-	fmt.Fprintln(w, "--\t----")
+	if _, err := fmt.Fprintln(w, "ID\tName"); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(w, "--\t----"); err != nil {
+		return err
+	}
 	// Also build a map of valid IDs
 	valid := make(map[string]bool, len(roots))
 	for _, r := range roots {
 		idStr := strconv.Itoa(r.ID)
-		fmt.Fprintf(w, "%s\t%s\n", idStr, r.Name)
+		if _, err := fmt.Fprintf(w, "%s\t%s\n", idStr, r.Name); err != nil {
+			return err
+		}
 		valid[idStr] = true
 	}
-	w.Flush()
+	if err := w.Flush(); err != nil {
+		return err
+	}
 
 	// 3) Loop until we get a valid, non-empty choice
 	reader := bufio.NewReader(os.Stdin)
@@ -1497,7 +1517,7 @@ func (ne *NetExplorer) ListRoots() ([]APIFolder, error) {
 		fs.Debugf(nil, "ListRoots: HTTP error after %v: %v", dt, err)
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer closeResponseBody(resp)
 	fs.Debugf(nil, "ListRoots: status=%d in %v", resp.StatusCode, dt)
 
 	// mirror original behavior of re-reading body
@@ -1543,7 +1563,7 @@ func (ne *NetExplorer) GetFile(fileID string) (*APIFile, error) {
 		fs.Debugf(nil, "GetFile(%s): HTTP error after %v: %v", fileID, dt, err)
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer closeResponseBody(resp)
 	fs.Debugf(nil, "GetFile(%s): status=%d in %v", fileID, resp.StatusCode, dt)
 
 	if resp.StatusCode != http.StatusOK {
@@ -2395,6 +2415,17 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	return rc, nil
 }
 
+func (o *Object) rewindUploadReader(in io.Reader, uploadErr error) error {
+	seeker, ok := in.(io.Seeker)
+	if !ok {
+		return fserrors.RetryError(fmt.Errorf("cannot retry in-place upload - reader is not seekable: %w", uploadErr))
+	}
+	if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to rewind upload reader: %w", err)
+	}
+	return nil
+}
+
 // Update re-uploads or creates the file
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	relPath := o.remote
@@ -2516,8 +2547,8 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 				o.fs.cacheUploadResponse(parentID, name, fi)
 				fs.Debugf(o.fs, "Update(%q): uploaded id=%d md5=%q (cached)", relPath, o.id, o.md5)
 			} else {
-				// For chunked uploads without immediate response, use smart hydration
-				fs.Debugf(o.fs, "Update(%q): chunked upload complete, using smart hydration", relPath)
+				// For uploads without immediate metadata, use smart hydration.
+				fs.Debugf(o.fs, "Update(%q): upload complete without metadata, using smart hydration", relPath)
 
 				// Try to get from upload cache first
 				if cachedFile, exists := o.fs.getCachedUpload(parentID, name); exists {
@@ -2546,9 +2577,8 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 				delay := time.Duration(float64(baseDelay) * math.Pow(2, float64(attempt)))
 				fs.Debugf(o.fs, "Update(%q): network timeout, retrying in %v (attempt %d/%d)", relPath, delay, attempt+1, maxRetries)
 				time.Sleep(delay)
-				// Rewind reader if possible for retry
-				if seeker, ok := in.(io.Seeker); ok {
-					seeker.Seek(0, io.SeekStart)
+				if rewindErr := o.rewindUploadReader(in, err); rewindErr != nil {
+					return rewindErr
 				}
 				continue
 			} else {
@@ -2562,9 +2592,8 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 				delay := time.Duration(float64(baseDelay) * math.Pow(2, float64(attempt)))
 				fs.Debugf(o.fs, "Update(%q): connection reset, retrying in %v (attempt %d/%d)", relPath, delay, attempt+1, maxRetries)
 				time.Sleep(delay)
-				// Rewind reader if possible for retry
-				if seeker, ok := in.(io.Seeker); ok {
-					seeker.Seek(0, io.SeekStart)
+				if rewindErr := o.rewindUploadReader(in, err); rewindErr != nil {
+					return rewindErr
 				}
 				continue
 			} else {
@@ -2595,12 +2624,8 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 					}
 					o.parentID = parentID
 
-					// Rewind reader if possible
-					if seeker, ok := in.(io.Seeker); ok {
-						seeker.Seek(0, io.SeekStart)
-					} else {
-						// Let the higher-level retry reopen a fresh source reader.
-						return fserrors.RetryError(fmt.Errorf("cannot retry in-place upload - reader is not seekable: %w", err))
+					if rewindErr := o.rewindUploadReader(in, err); rewindErr != nil {
+						return rewindErr
 					}
 					continue
 				} else {
@@ -2622,9 +2647,8 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 					delay := time.Duration(attempt+1) * 5 * time.Second // 5s, 10s, 15s
 					fs.Debugf(o.fs, "Update(%q): rate limited (429), waiting %v (attempt %d/%d)", relPath, delay, attempt+1, maxRetries)
 					time.Sleep(delay)
-					// Rewind reader if possible for retry
-					if seeker, ok := in.(io.Seeker); ok {
-						seeker.Seek(0, io.SeekStart)
+					if rewindErr := o.rewindUploadReader(in, err); rewindErr != nil {
+						return rewindErr
 					}
 					continue
 				} else {
@@ -2636,9 +2660,8 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 					delay := time.Duration(float64(baseDelay) * math.Pow(2, float64(attempt)))
 					fs.Debugf(o.fs, "Update(%q): server error (500), waiting %v (attempt %d/%d)", relPath, delay, attempt+1, maxRetries)
 					time.Sleep(delay)
-					// Rewind reader if possible for retry
-					if seeker, ok := in.(io.Seeker); ok {
-						seeker.Seek(0, io.SeekStart)
+					if rewindErr := o.rewindUploadReader(in, err); rewindErr != nil {
+						return rewindErr
 					}
 					continue
 				} else {
@@ -2834,7 +2857,7 @@ func (ne *NetExplorer) CreateFolder(parentID, name string, modTime time.Time, cr
 		fs.Debugf(nil, "CreateFolder(%q): HTTP error after %v: %v", name, dt, err)
 		return "", false, err
 	}
-	defer resp.Body.Close()
+	defer closeResponseBody(resp)
 	// Read response body for logging
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	fs.Debugf(nil, "CreateFolder(%q): FULL RESPONSE - status=%d in %v", name, resp.StatusCode, dt)
@@ -2930,8 +2953,7 @@ func (ne *NetExplorer) RemoveFolder(folderID, _ string) error {
 		fs.Debugf(nil, "RemoveFolder(%s): HTTP error after %v: %v", folderID, dt, err)
 		return err
 	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	drainAndCloseResponseBody(resp)
 	fs.Debugf(nil, "RemoveFolder(%s): status=%d in %v", folderID, resp.StatusCode, dt)
 
 	if resp.StatusCode != 204 && resp.StatusCode != 200 {
@@ -2970,7 +2992,7 @@ func (ne *NetExplorer) updateFolderDates(folderID string, modTime time.Time, cre
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer closeResponseBody(resp)
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
 		bodyBytes, _ := io.ReadAll(resp.Body)
@@ -3037,7 +3059,7 @@ func (ne *NetExplorer) streamInit(folderID, targetPath string, size int64, modTi
 		fs.Debugf(nil, "STREAM_INIT: HTTP error after %v: %v", dt, err)
 		return "", nil, err
 	}
-	defer resp.Body.Close()
+	defer closeResponseBody(resp)
 	fs.Debugf(nil, "STREAM_INIT: status=%d in %v", resp.StatusCode, dt)
 
 	raw, _ := io.ReadAll(resp.Body)
@@ -3091,7 +3113,19 @@ func (ne *NetExplorer) putStream(sessionKey string, data io.Reader, size int64) 
 	fs.Debugf(nil, "PUT_STREAM: PUT %s (size=%d)", url, size)
 
 	start := time.Now()
+	buildCount := 0
 	resp, err := ne.doRequestWithReauth(func(token string) (*http.Request, error) {
+		if buildCount > 0 {
+			seeker, ok := data.(io.Seeker)
+			if !ok {
+				return nil, fserrors.RetryError(errors.New("cannot retry stream upload after reauth - reader is not seekable"))
+			}
+			if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+				return nil, fmt.Errorf("failed to rewind stream upload after reauth: %w", err)
+			}
+		}
+		buildCount++
+
 		req, err := http.NewRequest("PUT", url, data)
 		if err != nil {
 			return nil, err
@@ -3110,7 +3144,7 @@ func (ne *NetExplorer) putStream(sessionKey string, data io.Reader, size int64) 
 		fs.Debugf(nil, "PUT_STREAM: HTTP error after %v: %v", dt, err)
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer closeResponseBody(resp)
 	fs.Debugf(nil, "PUT_STREAM: status=%d in %v", resp.StatusCode, dt)
 
 	// Read response body for logging
@@ -3161,17 +3195,13 @@ func (ne *NetExplorer) UploadFile(folderID, fileName string, data io.Reader, fil
 		return ne.uploadSingle(folderID, fileName, data, modTime, createdTime)
 	}
 
-	// Strategy 1: Very small files (< 64KB) - Direct upload
 	if fileSize < smallFileThreshold {
-		// Only log every 100th small file to reduce debug spam
-		if fileSize%100 == 0 {
-		}
 		return ne.uploadSingle(folderID, fileName, data, modTime, createdTime)
 	}
 
-	// Strategy 2: Medium files (64KB - 100MB) - Stream disabled → use chunked
+	// Strategy 2: Medium files (64KB - 100MB) - keep chunked until TUS flow is documented
 	if fileSize < mediumFileThreshold {
-		fs.Debugf(nil, "UploadFile(%q): medium file (%d bytes), streaming disabled → using chunked upload", fileName, fileSize)
+		fs.Debugf(nil, "UploadFile(%q): medium file (%d bytes), using chunked upload", fileName, fileSize)
 		return ne.uploadChunked(folderID, fileName, data, fileSize, chunkSize, modTime, createdTime)
 	}
 
@@ -3376,7 +3406,7 @@ func (ne *NetExplorer) uploadChunked(folderID, fileName string, data io.Reader, 
 
 		// ── Read & process response ──
 		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		closeResponseBody(resp)
 		isSuccess := resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK
 		if len(respBody) > 0 && isSuccess {
 			fs.Debugf(nil, "uploadChunked(%q): chunk %d server response body: %s", fileName, idx, string(respBody))
@@ -3549,7 +3579,7 @@ func (ne *NetExplorer) uploadSingle(folderID, fileName string, data io.Reader, m
 		fs.Debugf(nil, "uploadSingle(%q): HTTP error after %v: %v", fileName, dt, err)
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer closeResponseBody(resp)
 	fs.Debugf(nil, "uploadSingle(%q): status=%d in %v", fileName, resp.StatusCode, dt)
 
 	// Read response body for logging
@@ -3607,8 +3637,7 @@ func (ne *NetExplorer) DownloadFile(fileID, _ string) (io.ReadCloser, error) {
 		return nil, err
 	}
 	if resp.StatusCode != 200 {
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+		drainAndCloseResponseBody(resp)
 		fs.Debugf(nil, "DownloadFile(%s): status=%d in %v", fileID, resp.StatusCode, dt)
 		return nil, fmt.Errorf("DownloadFile failed %d", resp.StatusCode)
 	}
@@ -3699,8 +3728,7 @@ func (ne *NetExplorer) DeleteFile(fileID, _ string) error {
 		fs.Debugf(nil, "DeleteFile(%s): HTTP error after %v: %v", fileID, dt, err)
 		return err
 	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	drainAndCloseResponseBody(resp)
 	fs.Debugf(nil, "DeleteFile(%s): status=%d in %v", fileID, resp.StatusCode, dt)
 	if resp.StatusCode != 204 && resp.StatusCode != 200 {
 		return fmt.Errorf("DeleteFile failed %d", resp.StatusCode)
@@ -3765,7 +3793,7 @@ func (ne *NetExplorer) ListFolder(folderID string) ([]APIFolder, []APIFile, erro
 		fs.Debugf(nil, "ListFolder(%s): HTTP error after %v: %v", folderID, dt, err)
 		return nil, nil, err
 	}
-	defer resp.Body.Close()
+	defer closeResponseBody(resp)
 	fs.Debugf(nil, "ListFolder(%s): status=%d in %v", folderID, resp.StatusCode, dt)
 
 	raw, err := io.ReadAll(resp.Body)
@@ -3819,7 +3847,7 @@ func (ne *NetExplorer) ListFolderWithDepth(folderID string, depth int) ([]APIFol
 		fs.Debugf(nil, "ListFolderWithDepth(%s, depth=%d): HTTP error after %v: %v", folderID, depth, dt, err)
 		return nil, nil, err
 	}
-	defer resp.Body.Close()
+	defer closeResponseBody(resp)
 	fs.Debugf(nil, "ListFolderWithDepth(%s, depth=%d): status=%d in %v", folderID, depth, resp.StatusCode, dt)
 
 	raw, err := io.ReadAll(resp.Body)
@@ -3887,7 +3915,7 @@ func (ne *NetExplorer) ListFolderByPath(rootID string, pathSegments []string) (f
 		fs.Debugf(nil, "ListFolderByPath: HTTP error after %v: %v", dt, err)
 		return nil, nil, err
 	}
-	defer resp.Body.Close()
+	defer closeResponseBody(resp)
 	fs.Debugf(nil, "ListFolderByPath: status=%d in %v", resp.StatusCode, dt)
 
 	var root struct {
