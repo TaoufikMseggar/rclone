@@ -5,6 +5,9 @@ import (
 	"bytes"
 	"container/list"
 	"context"
+	"crypto/md5"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +31,7 @@ import (
 	"mime/multipart"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -45,17 +49,76 @@ var netExplorerForbiddenNameChars = regexp.MustCompile(`[\\/:*?"<>|]`)
 
 const (
 	defaultBaseURL              = "https://org.netexplorer.pro"
-	rcloneClientID              = "ig02bVi19GPWyaAn6S60i2MelF1g29IrCA5NqRYvCr8"
-	rcloneEncryptedClientSecret = "XJUaxXVsjnDH7V2ESPlHPagg5BLDEWTqQjRzmKyOhbxcg0OFZz_2k6YWTzzvEeMKxgMTYWa1WrIYnvA"
-
-	// TEST JOHAN
-	//rcloneClientID              = "FdjdTmAuHMK5q9xio-n7RiI3mVZZDhN-I8VI4bYy_60"
-	//rcloneEncryptedClientSecret = "dREEbXK8AGbIXs8N8B9VQ3djIxilorZv0DB1ZwgZGOndow0BBXjdfDrjfL3npLyax2MMhrqF6xus150"
-
-	// TEST NE-PREPROD
-	//rcloneClientID              = "1hDBH_cgxYKmvtX0hFU5yDQEKRygqhOJrkf00a3uQt6"
-	//rcloneEncryptedClientSecret = "5VflbKiuQnGwpZAjaCfHWoTySRxTXMCC5UZJLpUTVU8vYjGYNaRifepBEbLupu-AXwxQrQC32r3x66c"
+	rcloneClientID              = "53dd8290-08a3-4679-91c5-91e13a753daf"
+	rcloneEncryptedClientSecret = "6R4lx7xr5K6igGprq8DhBnz_Ge9XbJrT4IuWja452BYTsnOmLZhVa4KKQ-aZlzVZ8cgdGuMzip2b3kdmygQax_97r9ld0tQvPg74pgirhp0"
+	tusProtocolVersion          = "1.0.0"
+	tusPatchChunkSize           = 16 << 20
 )
+
+var errTusRestartSession = errors.New("netexplorer: tus session restart required")
+
+// endpointMetrics holds per-endpoint response-time stats.
+type endpointMetrics struct {
+	count   int64
+	totalMs int64
+	minMs   int64
+	maxMs   int64
+}
+
+// httpCallStats tracks per-endpoint response-time metrics across all doRequestWithReauth calls.
+type httpCallStats struct {
+	mu         sync.Mutex
+	byEndpoint map[string]*endpointMetrics
+	lastLog    time.Time
+}
+
+// reNumericSeg matches a URL path segment that is a plain integer ID (e.g. "12345").
+var reNumericSeg = regexp.MustCompile(`^\d+$`)
+
+// reRandomSeg matches a URL path segment that looks like a random/opaque ID:
+// at least 20 chars, only alphanumeric, dash, or underscore (covers UUIDs and TUS upload IDs).
+var reRandomSeg = regexp.MustCompile(`^[0-9a-zA-Z_\-]{20,}$`)
+
+// normalizeURLKey returns "METHOD /normalized/path" suitable as a stats map key.
+// Numeric and random-looking path segments are replaced with {id}.
+// Query strings are dropped.
+func normalizeURLKey(method string, u *url.URL) string {
+	parts := strings.Split(u.Path, "/")
+	for i, p := range parts {
+		if reNumericSeg.MatchString(p) || reRandomSeg.MatchString(p) {
+			parts[i] = "{id}"
+		}
+	}
+	return method + " " + strings.Join(parts, "/")
+}
+
+func (s *httpCallStats) record(method string, u *url.URL, ms int64) {
+	key := normalizeURLKey(method, u)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, ok := s.byEndpoint[key]
+	if !ok {
+		m = &endpointMetrics{minMs: ms, maxMs: ms}
+		s.byEndpoint[key] = m
+	}
+	m.count++
+	m.totalMs += ms
+	if ms < m.minMs {
+		m.minMs = ms
+	}
+	if ms > m.maxMs {
+		m.maxMs = ms
+	}
+	if time.Since(s.lastLog) >= 10*time.Second || s.lastLog.IsZero() {
+		for k, ep := range s.byEndpoint {
+			fs.Infof(nil, "[netexplorer] HTTP %-38s count=%4d  mean=%5dms  min=%5dms  max=%5dms",
+				k, ep.count, ep.totalMs/ep.count, ep.minMs, ep.maxMs)
+		}
+		s.lastLog = time.Now()
+	}
+}
+
+var globalHTTPStats = &httpCallStats{byEndpoint: make(map[string]*endpointMetrics)}
 
 // NetExplorer is the API client
 type NetExplorer struct {
@@ -134,6 +197,11 @@ type lruCache struct {
 type httpErr struct {
 	code int
 	body string
+}
+
+type tusOffsetMismatchErr struct {
+	serverOffset int64
+	body         string
 }
 
 // PerformanceMonitor tracks performance metrics for throttling detection
@@ -252,23 +320,42 @@ func NewNetExplorer() *NetExplorer {
 	}
 }
 
+type userAgentTransport struct {
+	base      http.RoundTripper
+	userAgent string
+}
+
+func (t *userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", t.userAgent)
+	}
+	return t.base.RoundTrip(req)
+}
+
 // createOptimizedHTTPClient creates an HTTP client with connection pooling and optimized settings
 func createOptimizedHTTPClient(timeoutSeconds int) *http.Client {
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second, // TCP keep-alive to prevent idle connections from being reset by firewalls/NAT
+	}
 	transport := &http.Transport{
-		MaxIdleConns:        200,               // Increased from 100 to 200
-		MaxIdleConnsPerHost: 50,                // Increased from 20 to 50
-		IdleConnTimeout:     120 * time.Second, // Increased from 90s to 120s
-		DisableCompression:  false,             // Enable compression
-		DisableKeepAlives:   false,             // Enable keep-alives
-		MaxConnsPerHost:     100,               // Increased from 50 to 100
-		// Let the overall client timeout control long-running uploads, especially for huge files.
+		DialContext:           dialer.DialContext,
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       120 * time.Second,
+		DisableCompression:    false,
+		DisableKeepAlives:     false,
+		MaxConnsPerHost:       100,
 		ResponseHeaderTimeout: 0,
-		ExpectContinueTimeout: 10 * time.Second, // Increased to 10 seconds for large uploads
+		ExpectContinueTimeout: 10 * time.Second,
 	}
 
 	return &http.Client{
-		Transport: transport,
-		Timeout:   time.Duration(timeoutSeconds) * time.Second,
+		Transport: &userAgentTransport{
+			base:      transport,
+			userAgent: "rclone/" + fs.Version,
+		},
+		Timeout: time.Duration(timeoutSeconds) * time.Second,
 	}
 }
 
@@ -292,6 +379,27 @@ func drainAndCloseResponseBody(resp *http.Response) {
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
+}
+
+func responseTimingHeaders(resp *http.Response) string {
+	if resp == nil {
+		return ""
+	}
+
+	headers := []string{
+		"X-NE-ExecTime",
+		"X-NE-SQLExecTime",
+		"X-NE-SQLReqCount",
+		"X-NE-RedisExecTime",
+		"X-NE-NatsExecTime",
+	}
+	parts := make([]string, 0, len(headers))
+	for _, name := range headers {
+		if value := strings.TrimSpace(resp.Header.Get(name)); value != "" {
+			parts = append(parts, fmt.Sprintf("%s=%s", name, value))
+		}
+	}
+	return strings.Join(parts, "  ")
 }
 
 func getDefaultOAuthClientSecret() (string, error) {
@@ -364,7 +472,20 @@ func (ne *NetExplorer) doRequestWithReauth(buildReq func(token string) (*http.Re
 		if err != nil {
 			return nil, err
 		}
-		return ne.Client.Do(req)
+		if req.Header.Get("User-Agent") == "" {
+			req.Header.Set("User-Agent", "rclone/"+fs.Version)
+		}
+		start := time.Now()
+		resp, err := ne.Client.Do(req)
+		dt := time.Since(start)
+		ms := dt.Milliseconds()
+		if err != nil {
+			fs.Debugf(nil, "[netexplorer] HTTP %s %s â†’ error in %dms: %v", req.Method, req.URL.Path, ms, err)
+		} else {
+			fs.Debugf(nil, "[netexplorer] HTTP %s %s â†’ %d in %dms", req.Method, req.URL.Path, resp.StatusCode, ms)
+			globalHTTPStats.record(req.Method, req.URL, ms)
+		}
+		return resp, err
 	}
 
 	resp, err := do()
@@ -782,19 +903,26 @@ func openKV(path string) (*bbolt.DB, error) {
 	return db, nil
 }
 func (e *httpErr) Error() string { return fmt.Sprintf("http %d: %s", e.code, e.body) }
+
+func (e *tusOffsetMismatchErr) Error() string {
+	if e.serverOffset >= 0 {
+		return fmt.Sprintf("tus offset mismatch at server offset %d: %s", e.serverOffset, e.body)
+	}
+	return fmt.Sprintf("tus offset mismatch: %s", e.body)
+}
 func isAlreadyExists(err error) bool {
 	var he *httpErr
 	if errors.As(err, &he) {
 		// NetExplorer may signal "already exists" with several status codes:
 		// - 409/422: explicit conflict / unprocessable entity
 		// - 403: in practice sometimes returned with a body like
-		//   {"error":"Un élément du même nom existe déjà. Veuillez saisir un nom différent."}
+		//   {"error":"Un Ã©lÃ©ment du mÃªme nom existe dÃ©jÃ . Veuillez saisir un nom diffÃ©rent."}
 		if he.code == http.StatusConflict || he.code == 422 {
 			return true
 		}
 		if he.code == http.StatusForbidden &&
 			(strings.Contains(he.body, "m\\u00eame nom existe d\\u00e9j\\u00e0") ||
-				strings.Contains(he.body, "même nom existe déjà")) {
+				strings.Contains(he.body, "mÃªme nom existe dÃ©jÃ ")) {
 			return true
 		}
 	}
@@ -1235,9 +1363,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		hashes:      hash.NewHashSet(hash.MD5),
 	}
 
-	// If root not set, prompt now — we need it before naming the cache file
+	// If root not set, prompt now â€” we need it before naming the cache file
 	if f.rootID == "" {
-		fs.Debugf(f, "NewFs: no rootID configured, invoking ensureRoot() …")
+		fs.Debugf(f, "NewFs: no rootID configured, invoking ensureRoot() â€¦")
 		if err := f.ensureRoot(ctx); err != nil {
 			return nil, err
 		}
@@ -1305,7 +1433,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		// If initialPath is non-empty (e.g. "netexplorer:some/sub/folder"),
 		// then the logical rclone root "" should correspond to that subfolder,
 		// not to the absolute API rootID. In that case we resolve the
-		// effective root folder ID now so that List(""), NewObject("…"),
+		// effective root folder ID now so that List(""), NewObject("â€¦"),
 		// NeedTransfer, etc. all see the correct tree.
 		if len(f.initialPath) == 0 {
 			f.idxPutFolder("", f.rootID)
@@ -1406,7 +1534,7 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	}
 
 	// Fallback to API call only if not in cache
-	fs.Debugf(o.fs, "Hash(%q): md5 not cached, calling GetFile(id=%d)…", o.remote, o.id)
+	fs.Debugf(o.fs, "Hash(%q): md5 not cached, calling GetFile(id=%d)â€¦", o.remote, o.id)
 	info, err := o.fs.ne.GetFile(strconv.Itoa(o.id))
 	if err != nil {
 		fs.Debugf(o.fs, "Hash(%q): GetFile error: %v", o.remote, err)
@@ -1439,7 +1567,7 @@ func joinPath(dir, name string) string {
 
 // ensureRoot checks and prompts the user if the configured root is empty or invalid
 func (f *Fs) ensureRoot(ctx context.Context) error {
-	fs.Debugf(f, "ensureRoot: prompting user to pick a root folder …")
+	fs.Debugf(f, "ensureRoot: prompting user to pick a root folder â€¦")
 	fmt.Println("No root folder configured. Please select one:")
 
 	start := time.Now()
@@ -1485,7 +1613,7 @@ func (f *Fs) ensureRoot(ctx context.Context) error {
 		if valid[choice] {
 			break
 		}
-		fmt.Println("⨯ Invalid ID, please enter one of the IDs listed above.")
+		fmt.Println("â¨¯ Invalid ID, please enter one of the IDs listed above.")
 	}
 
 	// 4) Save and set
@@ -1546,7 +1674,7 @@ func (ne *NetExplorer) ListRoots() ([]APIFolder, error) {
 }
 
 func (ne *NetExplorer) GetFile(fileID string) (*APIFile, error) {
-	url := fmt.Sprintf("%s/api/file/%s?full", ne.BaseURL, fileID)
+	url := fmt.Sprintf("%s/api/file/%s", ne.BaseURL, fileID)
 	fs.Debugf(nil, "GetFile: GET %s", url)
 
 	start := time.Now()
@@ -2426,6 +2554,16 @@ func (o *Object) rewindUploadReader(in io.Reader, uploadErr error) error {
 	return nil
 }
 
+func sourceObjectFromInfo(src fs.ObjectInfo) fs.Object {
+	if obj, ok := src.(fs.Object); ok {
+		return obj
+	}
+	if wrapped, ok := src.(fs.ObjectUnWrapper); ok {
+		return wrapped.UnWrap()
+	}
+	return nil
+}
+
 // Update re-uploads or creates the file
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	relPath := o.remote
@@ -2441,7 +2579,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 	parentID := o.parentID
 	if parentID == "" {
-		fs.Debugf(o.fs, "Update(%q): parentID not set, resolving…", relPath)
+		fs.Debugf(o.fs, "Update(%q): parentID not set, resolvingâ€¦", relPath)
 		var err error
 		parentID, err = o.fs.ensureFolderID(ctx, dir, true)
 		if err != nil {
@@ -2530,11 +2668,12 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 
 	uploadSuccess := false
+	sourceObject := sourceObjectFromInfo(src)
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		// Track performance for upload operations
 		o.fs.perfMonitor.IncrementCounter()
 
-		fi, err := o.fs.ne.UploadFile(parentID, name, in, src.Size(), modTime, createdTime)
+		fi, err := o.fs.ne.UploadFile(ctx, parentID, name, in, src.Size(), modTime, createdTime, sourceObject)
 		if err == nil {
 			// Success - handle the result
 			uploadSuccess = true
@@ -2875,7 +3014,7 @@ func (ne *NetExplorer) CreateFolder(parentID, name string, modTime time.Time, cr
 		// Prefer parsing as APIFolder to inspect the returned name and dates.
 		var af APIFolder
 		if err := json.Unmarshal(bodyBytes, &af); err == nil && af.ID != 0 {
-			// NetExplorer sometimes auto-renames on conflict, e.g. "BE_CAP" → "BE_CAP (1)".
+			// NetExplorer sometimes auto-renames on conflict, e.g. "BE_CAP" â†’ "BE_CAP (1)".
 			// Those should NOT be treated as the canonical folder for "name", otherwise
 			// rclone will happily use "name (1)" / "name (2)" as if they were "name".
 			//
@@ -2888,7 +3027,7 @@ func (ne *NetExplorer) CreateFolder(parentID, name string, modTime time.Time, cr
 				fs.Debugf(nil, "CreateFolder(%q): server returned different name %q (id=%d); treating as an \"already exists\" conflict and cleaning up auto-renamed folder", name, af.Name, af.ID)
 
 				// Best-effort cleanup: delete the auto-renamed folder we just caused
-				// the server to create, so that "name (1)", "name (2)", … do not
+				// the server to create, so that "name (1)", "name (2)", â€¦ do not
 				// accumulate in the user's tree. The canonical folder for "name"
 				// (created earlier by us or by another client) remains untouched.
 				go func(id int, reqName, actualName string) {
@@ -3009,8 +3148,664 @@ func (ne *NetExplorer) UpdateFolder(folderID string, modTime time.Time, createdT
 	return ne.updateFolderDates(folderID, modTime, createdTime)
 }
 
+func (ne *NetExplorer) updateFileMetadata(fileID string, modTime time.Time, createdTime time.Time) (*APIFile, error) {
+	payload := map[string]any{}
+	if !modTime.IsZero() {
+		payload["modification"] = modTime.UTC().Format(time.RFC3339)
+	}
+	if !createdTime.IsZero() {
+		payload["creation"] = createdTime.UTC().Format(time.RFC3339)
+	}
+	if len(payload) == 0 {
+		return nil, nil
+	}
+
+	url := fmt.Sprintf("%s/api/file/%s", ne.BaseURL, fileID)
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := ne.doRequestWithReauth(func(token string) (*http.Request, error) {
+		req, err := http.NewRequest("PUT", url, bytes.NewReader(b))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		return req, nil
+	}, false)
+	if err != nil {
+		return nil, err
+	}
+	defer closeResponseBody(resp)
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+		return nil, &httpErr{code: resp.StatusCode, body: string(body)}
+	}
+	if len(body) == 0 {
+		return nil, nil
+	}
+
+	var fi APIFile
+	if err := json.Unmarshal(body, &fi); err != nil {
+		return nil, nil
+	}
+	if fi.MD5 == "" && fi.Hash != "" {
+		fi.MD5 = fi.Hash
+	}
+	return &fi, nil
+}
+
+func timesWithinTolerance(a time.Time, b time.Time, tolerance time.Duration) bool {
+	if a.IsZero() || b.IsZero() {
+		return a.IsZero() && b.IsZero()
+	}
+	delta := a.Sub(b)
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta <= tolerance
+}
+
+func encodeTusMetadata(metadata map[string]string) string {
+	keys := make([]string, 0, len(metadata))
+	for key := range metadata {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		value := metadata[key]
+		if value == "" {
+			parts = append(parts, key)
+			continue
+		}
+		parts = append(parts, key+" "+base64.StdEncoding.EncodeToString([]byte(value)))
+	}
+	return strings.Join(parts, ",")
+}
+
+func (ne *NetExplorer) resolveTusLocation(location string) (string, error) {
+	if location == "" {
+		return "", errors.New("tus creation response missing Location header")
+	}
+
+	locationURL, err := url.Parse(location)
+	if err != nil {
+		return "", fmt.Errorf("invalid tus Location header %q: %w", location, err)
+	}
+	if locationURL.IsAbs() {
+		return locationURL.String(), nil
+	}
+
+	baseURL, err := url.Parse(ne.BaseURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid base URL %q: %w", ne.BaseURL, err)
+	}
+	return baseURL.ResolveReference(locationURL).String(), nil
+}
+
+func (ne *NetExplorer) tusSessionInit(folderID, fileName string, size int64) (string, error) {
+	url := ne.BaseURL + "/api/file/tus"
+	payload := map[string]any{
+		"name":   fileName,
+		"target": folderID,
+		"size":   size,
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := ne.doRequestWithReauth(func(token string) (*http.Request, error) {
+		req, err := http.NewRequest("POST", url, bytes.NewReader(b))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		return req, nil
+	}, false)
+	if err != nil {
+		return "", err
+	}
+	defer closeResponseBody(resp)
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return "", &httpErr{code: resp.StatusCode, body: string(body)}
+	}
+
+	var sessions []struct {
+		SessionKey string `json:"sessionKey"`
+	}
+	if err := json.Unmarshal(body, &sessions); err == nil && len(sessions) > 0 && sessions[0].SessionKey != "" {
+		return sessions[0].SessionKey, nil
+	}
+
+	var session struct {
+		SessionKey string `json:"sessionKey"`
+	}
+	if err := json.Unmarshal(body, &session); err == nil && session.SessionKey != "" {
+		return session.SessionKey, nil
+	}
+
+	return "", fmt.Errorf("tus init failed: sessionKey missing in response")
+}
+
+func (ne *NetExplorer) tusCreateUpload(sessionKey string, size int64) (string, error) {
+	url := ne.BaseURL + "/api/tus"
+	metadata := encodeTusMetadata(map[string]string{
+		"token": sessionKey,
+	})
+
+	resp, err := ne.doRequestWithReauth(func(token string) (*http.Request, error) {
+		req, err := http.NewRequest("POST", url, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Tus-Resumable", tusProtocolVersion)
+		req.Header.Set("Upload-Length", strconv.FormatInt(size, 10))
+		req.Header.Set("Upload-Metadata", metadata)
+		req.ContentLength = 0
+		return req, nil
+	}, false)
+	if err != nil {
+		return "", err
+	}
+	defer closeResponseBody(resp)
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return "", &httpErr{code: resp.StatusCode, body: string(body)}
+	}
+
+	return ne.resolveTusLocation(resp.Header.Get("Location"))
+}
+
+func (ne *NetExplorer) tusGetOffset(uploadURL string) (int64, error) {
+	resp, err := ne.doRequestWithReauth(func(token string) (*http.Request, error) {
+		req, err := http.NewRequest("HEAD", uploadURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Tus-Resumable", tusProtocolVersion)
+		return req, nil
+	}, false)
+	if err != nil {
+		return 0, err
+	}
+	defer drainAndCloseResponseBody(resp)
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(resp.Body)
+		return 0, &httpErr{code: resp.StatusCode, body: string(body)}
+	}
+
+	offsetHeader := resp.Header.Get("Upload-Offset")
+	if offsetHeader == "" {
+		return 0, errors.New("tus HEAD response missing Upload-Offset header")
+	}
+	offset, err := strconv.ParseInt(offsetHeader, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid Upload-Offset %q: %w", offsetHeader, err)
+	}
+	return offset, nil
+}
+
+func (ne *NetExplorer) tusPatch(uploadURL string, offset int64, chunk []byte) (int64, error) {
+	resp, err := ne.doRequestWithReauth(func(token string) (*http.Request, error) {
+		req, err := http.NewRequest("PATCH", uploadURL, bytes.NewReader(chunk))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Tus-Resumable", tusProtocolVersion)
+		req.Header.Set("Upload-Offset", strconv.FormatInt(offset, 10))
+		req.Header.Set("Content-Type", "application/offset+octet-stream")
+		req.Header.Del("Expect")
+		req.ContentLength = int64(len(chunk))
+		return req, nil
+	}, false)
+	if err != nil {
+		return 0, err
+	}
+	defer closeResponseBody(resp)
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		if resp.StatusCode == http.StatusConflict {
+			serverOffset := int64(-1)
+			if offsetHeader := resp.Header.Get("Upload-Offset"); offsetHeader != "" {
+				if parsed, parseErr := strconv.ParseInt(offsetHeader, 10, 64); parseErr == nil {
+					serverOffset = parsed
+				}
+			}
+			return 0, &tusOffsetMismatchErr{serverOffset: serverOffset, body: string(body)}
+		}
+		return 0, &httpErr{code: resp.StatusCode, body: string(body)}
+	}
+
+	offsetHeader := resp.Header.Get("Upload-Offset")
+	if offsetHeader == "" {
+		return offset + int64(len(chunk)), nil
+	}
+	nextOffset, err := strconv.ParseInt(offsetHeader, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid Upload-Offset %q: %w", offsetHeader, err)
+	}
+	return nextOffset, nil
+}
+
+func (ne *NetExplorer) tusFinalize(sessionKey string) (*APIFile, error) {
+	url := ne.BaseURL + "/api/file/tus"
+	payload := map[string]string{
+		"token": sessionKey,
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := ne.doRequestWithReauth(func(token string) (*http.Request, error) {
+		req, err := http.NewRequest("POST", url, bytes.NewReader(b))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		return req, nil
+	}, false)
+	if err != nil {
+		return nil, err
+	}
+	defer closeResponseBody(resp)
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return nil, &httpErr{code: resp.StatusCode, body: string(body)}
+	}
+
+	var fi APIFile
+	if err := json.Unmarshal(body, &fi); err != nil {
+		return nil, fmt.Errorf("tus finalize: failed to decode file response: %w", err)
+	}
+	if fi.MD5 == "" && fi.Hash != "" {
+		fi.MD5 = fi.Hash
+	}
+	return &fi, nil
+}
+
+func (ne *NetExplorer) cancelTusUpload(uploadURL string) error {
+	resp, err := ne.doRequestWithReauth(func(token string) (*http.Request, error) {
+		req, err := http.NewRequest("DELETE", uploadURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Tus-Resumable", tusProtocolVersion)
+		return req, nil
+	}, false)
+	if err != nil {
+		return err
+	}
+	defer closeResponseBody(resp)
+
+	body, _ := io.ReadAll(resp.Body)
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusNoContent, http.StatusNotFound, http.StatusGone:
+		return nil
+	default:
+		return &httpErr{code: resp.StatusCode, body: string(body)}
+	}
+}
+
+func (ne *NetExplorer) uploadTus(ctx context.Context, folderID, fileName string, data io.Reader, fileSize int64, modTime time.Time, createdTime time.Time, sourceObject fs.Object) (*APIFile, error) {
+	maxSessionRestarts := ne.opt.UploadRetries
+	if maxSessionRestarts <= 0 {
+		maxSessionRestarts = 3
+	}
+	baseDelay := time.Duration(ne.opt.RetryDelayBase) * time.Second
+	if baseDelay <= 0 {
+		baseDelay = time.Second
+	}
+
+	currentReader := data
+	accountReader, _ := data.(*accounting.Account)
+	var reopenedReader io.ReadCloser
+	lastCancelledUploadURL := ""
+	lastCancelledOffset := int64(-1)
+	resumeResetAttempts := 0
+
+	reopenSourceAtOffset := func(offset int64) error {
+		if sourceObject == nil {
+			return errors.New("source object does not support reopen")
+		}
+		rc, err := sourceObject.Open(ctx, &fs.HashesOption{Hashes: hash.Set(hash.None)}, &fs.RangeOption{Start: offset, End: -1})
+		if err != nil {
+			return fmt.Errorf("failed to reopen source at offset %d: %w", offset, err)
+		}
+		if accountReader != nil {
+			oldReader := accountReader.GetReader()
+			accountReader.UpdateReader(ctx, rc)
+			if oldReader != nil {
+				_ = oldReader.Close()
+			}
+			currentReader = accountReader
+			return nil
+		}
+		if reopenedReader != nil {
+			_ = reopenedReader.Close()
+		}
+		reopenedReader = rc
+		currentReader = rc
+		return nil
+	}
+	defer func() {
+		if reopenedReader != nil {
+			_ = reopenedReader.Close()
+		}
+	}()
+
+	restartUpload := func(uploadErr error) error {
+		if err := reopenSourceAtOffset(0); err == nil {
+			return nil
+		}
+		seeker, ok := data.(io.Seeker)
+		if !ok {
+			return fserrors.RetryError(fmt.Errorf("cannot restart tus upload session - reader is not seekable: %w", uploadErr))
+		}
+		if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("failed to rewind tus upload reader: %w", err)
+		}
+		return nil
+	}
+
+	tusDelay := func(attempt int) time.Duration {
+		return time.Duration(float64(baseDelay) * math.Pow(2, float64(attempt)))
+	}
+
+	setReaderOffset := func(targetOffset int64) error {
+		if targetOffset <= 0 {
+			return nil
+		}
+		if err := reopenSourceAtOffset(targetOffset); err == nil {
+			return nil
+		}
+		if seeker, ok := data.(io.Seeker); ok {
+			if _, err := seeker.Seek(targetOffset, io.SeekStart); err == nil {
+				return nil
+			} else {
+				fs.Debugf(nil, "uploadTus(%q): absolute seek to offset %d failed, falling back to stream discard: %v", fileName, targetOffset, err)
+			}
+		}
+		skipped, err := io.CopyN(io.Discard, data, targetOffset)
+		if err != nil {
+			return fmt.Errorf("failed to advance tus upload reader to offset %d (skipped %d): %w", targetOffset, skipped, err)
+		}
+		return nil
+	}
+	advanceReader := func(delta int64) error {
+		if delta <= 0 {
+			return nil
+		}
+		if sourceObject != nil {
+			return errors.New("relative advance is not supported when source reopen is available")
+		}
+		if seeker, ok := data.(io.Seeker); ok {
+			if _, err := seeker.Seek(delta, io.SeekCurrent); err == nil {
+				return nil
+			} else {
+				fs.Debugf(nil, "uploadTus(%q): relative seek by %d bytes failed, falling back to stream discard: %v", fileName, delta, err)
+			}
+		}
+		skipped, err := io.CopyN(io.Discard, data, delta)
+		if err != nil {
+			return fmt.Errorf("failed to advance tus upload reader by %d bytes (skipped %d): %w", delta, skipped, err)
+		}
+		return nil
+	}
+
+uploadSession:
+	for sessionAttempt := 0; sessionAttempt <= maxSessionRestarts; sessionAttempt++ {
+		sessionKey, err := ne.tusSessionInit(folderID, fileName, fileSize)
+		if err != nil {
+			return nil, err
+		}
+		uploadURL, err := ne.tusCreateUpload(sessionKey, fileSize)
+		if err != nil {
+			return nil, err
+		}
+
+		fs.Debugf(nil, "uploadTus(%q): session %d/%d created, uploadURL=%q", fileName, sessionAttempt+1, maxSessionRestarts+1, uploadURL)
+
+		offset, err := ne.tusGetOffset(uploadURL)
+		if err != nil {
+			return nil, fmt.Errorf("tus initial offset probe failed: %w", err)
+		}
+		if offset < 0 || offset > fileSize {
+			return nil, fmt.Errorf("tus initial offset %d is invalid for file size %d", offset, fileSize)
+		}
+		if lastCancelledUploadURL != "" && uploadURL == lastCancelledUploadURL && offset == lastCancelledOffset {
+			return nil, fserrors.NoRetryError(fmt.Errorf("tus session reset failed: server returned the same upload resource %q at offset %d after cancel", uploadURL, offset))
+		}
+		if err := setReaderOffset(offset); err != nil {
+			return nil, err
+		}
+		if offset > 0 {
+			fs.Debugf(nil, "uploadTus(%q): resuming existing upload from offset %d", fileName, offset)
+		}
+
+		for offset < fileSize {
+			chunkStart := offset
+			chunkSize := int64(tusPatchChunkSize)
+			if remaining := fileSize - chunkStart; remaining < chunkSize {
+				chunkSize = remaining
+			}
+
+			buf := make([]byte, int(chunkSize))
+			if _, err := io.ReadFull(currentReader, buf); err != nil {
+				return nil, fmt.Errorf("read tus chunk at offset %d: %w", chunkStart, err)
+			}
+
+			chunkEnd := chunkStart + int64(len(buf))
+			chunkOffset := chunkStart
+			patchAttempts := 0
+
+			for chunkOffset < chunkEnd {
+				nextOffset, err := ne.tusPatch(uploadURL, chunkOffset, buf[int(chunkOffset-chunkStart):])
+				if err == nil {
+					if nextOffset < chunkOffset {
+						return nil, fmt.Errorf("tus PATCH returned inconsistent offset %d for chunk [%d,%d)", nextOffset, chunkStart, chunkEnd)
+					}
+					if nextOffset > chunkEnd {
+						skipAhead := nextOffset - chunkEnd
+						if nextOffset > fileSize {
+							return nil, fmt.Errorf("tus PATCH returned inconsistent offset %d for file size %d", nextOffset, fileSize)
+						}
+						if skipAhead > 0 {
+							if sourceObject != nil {
+								if err := setReaderOffset(nextOffset); err != nil {
+									return nil, err
+								}
+							} else if err := advanceReader(skipAhead); err != nil {
+								return nil, err
+							}
+						}
+						fs.Debugf(nil, "uploadTus(%q): PATCH acknowledged offset %d beyond current chunk [%d,%d), advancing local reader", fileName, nextOffset, chunkStart, chunkEnd)
+					}
+					chunkOffset = nextOffset
+					offset = nextOffset
+					patchAttempts = 0
+					continue
+				}
+
+				var mismatchErr *tusOffsetMismatchErr
+				if errors.As(err, &mismatchErr) {
+					serverOffset := mismatchErr.serverOffset
+					if serverOffset < 0 {
+						probedOffset, probeErr := ne.tusGetOffset(uploadURL)
+						if probeErr != nil {
+							return nil, fmt.Errorf("tus resume probe failed after mismatch: %w", probeErr)
+						}
+						serverOffset = probedOffset
+					}
+					if serverOffset == chunkOffset {
+						if resumeResetAttempts >= 1 {
+							return nil, fserrors.NoRetryError(fmt.Errorf("tus resume inconsistency at offset %d: PATCH rejected the offset reported by the server after session reset", serverOffset))
+						}
+						if cancelErr := ne.cancelTusUpload(uploadURL); cancelErr != nil {
+							fs.Debugf(nil, "uploadTus(%q): failed to cancel inconsistent TUS upload resource %q before restart: %v", fileName, uploadURL, cancelErr)
+						} else {
+							fs.Debugf(nil, "uploadTus(%q): cancelled inconsistent TUS upload resource %q before restarting session", fileName, uploadURL)
+						}
+						lastCancelledUploadURL = uploadURL
+						lastCancelledOffset = serverOffset
+						resumeResetAttempts++
+						if rewindErr := restartUpload(err); rewindErr != nil {
+							return nil, rewindErr
+						}
+						delay := tusDelay(resumeResetAttempts - 1)
+						fs.Debugf(nil, "uploadTus(%q): restarting session after resume inconsistency at offset %d in %v", fileName, serverOffset, delay)
+						time.Sleep(delay)
+						continue uploadSession
+					}
+					if serverOffset < chunkStart {
+						if sessionAttempt >= maxSessionRestarts {
+							return nil, errTusRestartSession
+						}
+						if rewindErr := restartUpload(err); rewindErr != nil {
+							return nil, rewindErr
+						}
+						delay := tusDelay(sessionAttempt)
+						fs.Debugf(nil, "uploadTus(%q): mismatch moved server offset behind current chunk to %d, restarting session in %v", fileName, serverOffset, delay)
+						time.Sleep(delay)
+						continue uploadSession
+					}
+					if serverOffset > chunkEnd {
+						if err := setReaderOffset(serverOffset); err != nil {
+							return nil, err
+						}
+						fs.Debugf(nil, "uploadTus(%q): mismatch moved server offset to %d beyond current chunk [%d,%d), reopening source there", fileName, serverOffset, chunkStart, chunkEnd)
+						offset = serverOffset
+						chunkOffset = chunkEnd
+						break
+					}
+					chunkOffset = serverOffset
+					offset = serverOffset
+					fs.Debugf(nil, "uploadTus(%q): mismatch realigned upload to offset %d", fileName, serverOffset)
+					continue
+				}
+
+				var he *httpErr
+				if errors.As(err, &he) && (he.code == http.StatusNotFound || he.code == http.StatusGone) {
+					if sessionAttempt >= maxSessionRestarts {
+						return nil, err
+					}
+					if rewindErr := restartUpload(err); rewindErr != nil {
+						return nil, rewindErr
+					}
+					delay := tusDelay(sessionAttempt)
+					fs.Debugf(nil, "uploadTus(%q): upload resource lost (status=%d), restarting session in %v", fileName, he.code, delay)
+					time.Sleep(delay)
+					continue uploadSession
+				}
+
+				serverOffset, headErr := ne.tusGetOffset(uploadURL)
+				if headErr != nil {
+					var headHTTP *httpErr
+					if errors.As(headErr, &headHTTP) && (headHTTP.code == http.StatusNotFound || headHTTP.code == http.StatusGone) {
+						if sessionAttempt >= maxSessionRestarts {
+							return nil, headErr
+						}
+						if rewindErr := restartUpload(err); rewindErr != nil {
+							return nil, rewindErr
+						}
+						delay := tusDelay(sessionAttempt)
+						fs.Debugf(nil, "uploadTus(%q): HEAD reports missing upload resource, restarting session in %v", fileName, delay)
+						time.Sleep(delay)
+						continue uploadSession
+					}
+					return nil, fmt.Errorf("tus resume probe failed at offset %d: %w", chunkOffset, headErr)
+				}
+
+				if serverOffset < chunkStart {
+					if sessionAttempt >= maxSessionRestarts {
+						return nil, errTusRestartSession
+					}
+					if rewindErr := restartUpload(err); rewindErr != nil {
+						return nil, rewindErr
+					}
+					delay := tusDelay(sessionAttempt)
+					fs.Debugf(nil, "uploadTus(%q): server offset %d fell behind current chunk [%d,%d), restarting session in %v", fileName, serverOffset, chunkStart, chunkEnd, delay)
+					time.Sleep(delay)
+					continue uploadSession
+				}
+				if serverOffset > chunkEnd {
+					return nil, fmt.Errorf("tus server offset %d exceeds buffered chunk end %d", serverOffset, chunkEnd)
+				}
+
+				chunkOffset = serverOffset
+				offset = serverOffset
+				patchAttempts++
+				if patchAttempts > maxSessionRestarts+1 {
+					return nil, fmt.Errorf("tus PATCH failed repeatedly around offset %d: %w", serverOffset, err)
+				}
+				delay := tusDelay(patchAttempts - 1)
+				fs.Debugf(nil, "uploadTus(%q): resuming from offset %d after patch error: %v", fileName, serverOffset, err)
+				time.Sleep(delay)
+			}
+		}
+
+		var finalInfo *APIFile
+		var finalizeErr error
+		for finalizeAttempt := 0; finalizeAttempt <= maxSessionRestarts; finalizeAttempt++ {
+			finalInfo, finalizeErr = ne.tusFinalize(sessionKey)
+			if finalizeErr == nil {
+				break
+			}
+
+			var he *httpErr
+			if !errors.As(finalizeErr, &he) {
+				return nil, finalizeErr
+			}
+			if he.code != http.StatusLocked && he.code != http.StatusTooManyRequests && he.code != http.StatusInternalServerError {
+				return nil, finalizeErr
+			}
+
+			delay := tusDelay(finalizeAttempt)
+			fs.Debugf(nil, "uploadTus(%q): finalize retry in %v after status %d", fileName, delay, he.code)
+			time.Sleep(delay)
+		}
+		if finalizeErr != nil {
+			return nil, finalizeErr
+		}
+
+		if finalInfo != nil && (!modTime.IsZero() || !createdTime.IsZero()) {
+			updatedInfo, err := ne.updateFileMetadata(strconv.Itoa(finalInfo.ID), modTime, createdTime)
+			if err != nil {
+				fs.Debugf(nil, "uploadTus(%q): failed to update file metadata after finalize: %v", fileName, err)
+			} else if updatedInfo != nil {
+				finalInfo = updatedInfo
+			}
+		}
+
+		return finalInfo, nil
+	}
+
+	return nil, errTusRestartSession
+}
+
 // UploadFile uploads data into folderID.
-// If fileSize ≤ 16 MiB it uses the classic one-shot endpoint.
+// If fileSize â‰¤ 16 MiB it uses the classic one-shot endpoint.
 // Otherwise it streams the file in 16 MiB blocks with the
 //
 //	chunk / chunks / chunksSize / fileSize protocol required by NetExplorer.
@@ -3019,14 +3814,14 @@ func (ne *NetExplorer) UpdateFolder(folderID string, modTime time.Time, createdT
 // NOTE: this keeps the "pre-fix" behavior you showed (targetPath = base name).
 func (ne *NetExplorer) streamInit(folderID, targetPath string, size int64, modTime time.Time, createdTime time.Time) (string, *APIFile, error) {
 	url := ne.BaseURL + "/api/file/upload"
-	// NOTE (pre-fix): send only the base name → server places it at root.
+	// NOTE (pre-fix): send only the base name â†’ server places it at root.
 	base := path.Base(targetPath)
 	fs.Debugf(nil, "STREAM_INIT: POST %s folder=%s targetPath=%q size=%d method=stream", url, folderID, base, size)
 
 	payload := map[string]any{
 		"fileSize":     size,
 		"folderId":     folderID,
-		"targetPath":   base, // <— old behavior (server may ignore folderId for stream pathing)
+		"targetPath":   base, // <â€” old behavior (server may ignore folderId for stream pathing)
 		"uploadMethod": "stream",
 	}
 
@@ -3076,7 +3871,7 @@ func (ne *NetExplorer) streamInit(folderID, targetPath string, size int64, modTi
 	var generic map[string]any
 	if err := json.Unmarshal(raw, &generic); err == nil {
 		if sk, ok := generic["sessionKey"].(string); ok && sk != "" {
-			fs.Debugf(nil, "STREAM_INIT: received sessionKey=%s…", sk[:4]+"…")
+			fs.Debugf(nil, "STREAM_INIT: received sessionKey=%sâ€¦", sk[:4]+"â€¦")
 			return sk, nil, nil
 		}
 		if _, hasID := generic["id"]; hasID {
@@ -3109,7 +3904,7 @@ func (ne *NetExplorer) streamInit(folderID, targetPath string, size int64, modTi
 // Server may respond with JSON metadata or an empty body; handle both.
 func (ne *NetExplorer) putStream(sessionKey string, data io.Reader, size int64) (*APIFile, error) {
 	// Common pattern is the same endpoint with a query param; adjust if your API differs.
-	url := ne.BaseURL + "/api/file/upload?sessionKey=" + url.QueryEscape(sessionKey) + "&full=1"
+	url := ne.BaseURL + "/api/file/upload?sessionKey=" + url.QueryEscape(sessionKey)
 	fs.Debugf(nil, "PUT_STREAM: PUT %s (size=%d)", url, size)
 
 	start := time.Now()
@@ -3145,7 +3940,11 @@ func (ne *NetExplorer) putStream(sessionKey string, data io.Reader, size int64) 
 		return nil, err
 	}
 	defer closeResponseBody(resp)
-	fs.Debugf(nil, "PUT_STREAM: status=%d in %v", resp.StatusCode, dt)
+	if timing := responseTimingHeaders(resp); timing != "" {
+		fs.Debugf(nil, "PUT_STREAM: status=%d in %v (%s)", resp.StatusCode, dt, timing)
+	} else {
+		fs.Debugf(nil, "PUT_STREAM: status=%d in %v", resp.StatusCode, dt)
+	}
 
 	// Read response body for logging
 	bodyBytes, _ := io.ReadAll(resp.Body)
@@ -3168,15 +3967,13 @@ func (ne *NetExplorer) putStream(sessionKey string, data io.Reader, size int64) 
 		fs.Debugf(nil, "PUT_STREAM: parsed response - id=%d name=%q size=%d md5=%q creation=%v modification=%v", fi.ID, fi.Name, fi.Size, fi.MD5, fi.Creation, fi.Modification)
 		return &fi, nil
 	}
-	// No JSON body → caller will hydrate later
+	// No JSON body â†’ caller will hydrate later
 	fs.Debugf(nil, "PUT_STREAM: no JSON metadata returned; will rely on hydrate to find id")
 	return nil, nil
 }
 
-func (ne *NetExplorer) UploadFile(folderID, fileName string, data io.Reader, fileSize int64, modTime time.Time, createdTime time.Time) (*APIFile, error) {
-	const chunkSize = 16 << 20                    // 16 MiB
-	const smallFileThreshold = 16 * 1024 * 1024   // 16MB - use direct upload for most files
-	const mediumFileThreshold = 100 * 1024 * 1024 // 100MB - medium files use stream, big files use chunks
+func (ne *NetExplorer) UploadFile(ctx context.Context, folderID, fileName string, data io.Reader, fileSize int64, modTime time.Time, createdTime time.Time, sourceObject fs.Object) (*APIFile, error) {
+	const smallFileThreshold = 16 * 1024 * 1024 // 16 MiB
 
 	// Only log large files to reduce debug overhead
 	if fileSize > 10*1024*1024 { // Only log files larger than 10MB
@@ -3186,28 +3983,21 @@ func (ne *NetExplorer) UploadFile(folderID, fileName string, data io.Reader, fil
 	// Handle unknown file size - use direct upload
 	if fileSize < 0 {
 		fs.Debugf(nil, "UploadFile(%q): unknown file size, using direct upload", fileName)
-		return ne.uploadSingle(folderID, fileName, data, modTime, createdTime)
+		return ne.uploadSingle(ctx, folderID, fileName, data, fileSize, modTime, createdTime, sourceObject)
 	}
 
 	// Handle empty files
 	if fileSize == 0 {
 		fs.Debugf(nil, "UploadFile(%q): empty file, using direct upload", fileName)
-		return ne.uploadSingle(folderID, fileName, data, modTime, createdTime)
+		return ne.uploadSingle(ctx, folderID, fileName, data, fileSize, modTime, createdTime, sourceObject)
 	}
 
 	if fileSize < smallFileThreshold {
-		return ne.uploadSingle(folderID, fileName, data, modTime, createdTime)
+		return ne.uploadSingle(ctx, folderID, fileName, data, fileSize, modTime, createdTime, sourceObject)
 	}
 
-	// Strategy 2: Medium files (64KB - 100MB) - keep chunked until TUS flow is documented
-	if fileSize < mediumFileThreshold {
-		fs.Debugf(nil, "UploadFile(%q): medium file (%d bytes), using chunked upload", fileName, fileSize)
-		return ne.uploadChunked(folderID, fileName, data, fileSize, chunkSize, modTime, createdTime)
-	}
-
-	// Strategy 3: Big files (>= 100MB) - Use chunked upload directly
-	fs.Debugf(nil, "UploadFile(%q): big file (%d bytes), using chunked upload", fileName, fileSize)
-	return ne.uploadChunked(folderID, fileName, data, fileSize, chunkSize, modTime, createdTime)
+	fs.Debugf(nil, "UploadFile(%q): large file (%d bytes), using TUS upload", fileName, fileSize)
+	return ne.uploadTus(ctx, folderID, fileName, data, fileSize, modTime, createdTime, sourceObject)
 }
 
 // parseChunkReportMissing parses a chunk upload report response and returns
@@ -3226,295 +4016,63 @@ func parseChunkReportMissing(body []byte) (missing int, ok bool) {
 	return report[0].Missing, true
 }
 
-// --- helper for chunked uploads ---------------------------------------------
-
-// uploadChunked handles chunked uploads for files that are too large for direct upload.
-func (ne *NetExplorer) uploadChunked(folderID, fileName string, data io.Reader, fileSize int64, chunkSize int64, modTime time.Time, createdTime time.Time) (*APIFile, error) {
-	totalChunks := int((fileSize + chunkSize - 1) / chunkSize)
-	lastChunkIdx := totalChunks - 1
-
-	// Double buffers for read-ahead pipelining
-	bufs := [2][]byte{make([]byte, chunkSize), make([]byte, chunkSize)}
-
-	chunkRetries := make(map[int]int)
-	var finalInfo *APIFile
-
-	// Read-ahead state: a goroutine reads the next chunk while the current one uploads.
-	type readAheadResult struct{ err error }
-	var pendingRead chan readAheadResult
-	pendingReadIdx := -1
-
-	// drainReadAhead waits for any in-flight read-ahead goroutine to finish.
-	// Must be called before seeking or re-reading from data.
-	drainReadAhead := func() {
-		if pendingRead != nil {
-			<-pendingRead
-			pendingRead = nil
-			pendingReadIdx = -1
-		}
-	}
-
-	// skipRead: when true, the current chunk's data is already in curBuf
-	// from the previous attempt – skip reading and read-ahead start.
-	skipRead := false
-
-	for idx := 0; idx < totalChunks; idx++ {
-		curBuf := bufs[idx%2]
-		need := int(chunkSize)
-		if rem := fileSize - int64(idx)*chunkSize; rem < chunkSize {
-			need = int(rem)
-		}
-
-		// ── Get chunk data: from read-ahead, direct read, or reuse (skipRead) ──
-		if skipRead {
-			// Data is already in curBuf from the previous attempt.
-			skipRead = false
-		} else if pendingRead != nil && pendingReadIdx == idx {
-			res := <-pendingRead
-			pendingRead = nil
-			pendingReadIdx = -1
-			if res.err != nil {
-				fs.Debugf(nil, "uploadChunked(%q): read-ahead chunk %d error: %v", fileName, idx, res.err)
-				return nil, fmt.Errorf("read chunk %d: %w", idx, res.err)
-			}
-		} else {
-			if _, err := io.ReadFull(data, curBuf[:need]); err != nil {
-				fs.Debugf(nil, "uploadChunked(%q): read chunk %d error: %v", fileName, idx, err)
-				return nil, fmt.Errorf("read chunk %d: %w", idx, err)
-			}
-		}
-
-		// ── Start read-ahead for next chunk (skip if we are retrying) ──
-		if idx < lastChunkIdx && pendingRead == nil {
-			nextBuf := bufs[(idx+1)%2]
-			nextNeed := int(chunkSize)
-			if rem := fileSize - int64(idx+1)*chunkSize; rem < chunkSize {
-				nextNeed = int(rem)
-			}
-			ch := make(chan readAheadResult, 1)
-			pendingRead = ch
-			pendingReadIdx = idx + 1
-			go func(buf []byte, n int) {
-				_, err := io.ReadFull(data, buf[:n])
-				ch <- readAheadResult{err}
-			}(nextBuf, nextNeed)
-		}
-
-		// ── Build streaming multipart body ──
-		// Write fields + file-part header into a small buffer, then stream the
-		// chunk data via io.MultiReader to avoid copying it.
-		var hdr bytes.Buffer
-		mw := multipart.NewWriter(&hdr)
-
-		formFields := map[string]string{
-			"folderId":   folderID,
-			"chunk":      strconv.Itoa(idx),
-			"chunks":     strconv.Itoa(totalChunks),
-			"chunksSize": strconv.FormatInt(chunkSize, 10),
-			"fileSize":   strconv.FormatInt(fileSize, 10),
-			"report":     "1",
-		}
-
-		_ = mw.WriteField("folderId", folderID)
-		_ = mw.WriteField("chunk", strconv.Itoa(idx))
-		_ = mw.WriteField("chunks", strconv.Itoa(totalChunks))
-		_ = mw.WriteField("chunksSize", strconv.FormatInt(chunkSize, 10))
-		_ = mw.WriteField("fileSize", strconv.FormatInt(fileSize, 10))
-		_ = mw.WriteField("report", "1")
-
-		// Add dates on the first chunk AND the last chunk
-		if idx == 0 || idx == lastChunkIdx {
-			if !modTime.IsZero() {
-				modTimeStr := modTime.UTC().Format(time.RFC3339)
-				_ = mw.WriteField("modification", modTimeStr)
-				formFields["modification"] = modTimeStr
-				if idx == 0 {
-					fs.Debugf(nil, "uploadChunked(%q): chunk %d adding modification=%q (UTC)", fileName, idx, modTimeStr)
-				} else {
-					fs.Debugf(nil, "uploadChunked(%q): last chunk %d adding modification=%q (UTC)", fileName, idx, modTimeStr)
-				}
-			} else {
-				fs.Debugf(nil, "uploadChunked(%q): chunk %d modTime is zero, not sending modification field", fileName, idx)
-			}
-			if !createdTime.IsZero() {
-				createdTimeStr := createdTime.UTC().Format(time.RFC3339)
-				_ = mw.WriteField("creation", createdTimeStr)
-				formFields["creation"] = createdTimeStr
-				if idx == 0 {
-					fs.Debugf(nil, "uploadChunked(%q): chunk %d adding creation=%q (UTC)", fileName, idx, createdTimeStr)
-				} else {
-					fs.Debugf(nil, "uploadChunked(%q): last chunk %d adding creation=%q (UTC)", fileName, idx, createdTimeStr)
-				}
-			} else {
-				fs.Debugf(nil, "uploadChunked(%q): chunk %d createdTime is zero, not sending creation field", fileName, idx)
-			}
-			fs.Debugf(nil, "uploadChunked(%q): chunk %d request form fields: %v", fileName, idx, formFields)
-		}
-
-		// Write the file-part header (boundary + Content-Disposition) but NOT the data.
-		_, _ = mw.CreateFormFile("targetFile", fileName)
-		contentType := mw.FormDataContentType()
-		closingBoundary := fmt.Sprintf("\r\n--%s--\r\n", mw.Boundary())
-
-		// Capture header bytes; these are small (~500 bytes).
-		hdrBytes := hdr.Bytes()
-		bodySize := int64(len(hdrBytes)) + int64(need) + int64(len(closingBoundary))
-
-		// ── Upload chunk (streaming) ──
-		start := time.Now()
-		resp, err := ne.doRequestWithReauth(func(token string) (*http.Request, error) {
-			// Reconstruct fresh readers for each attempt (reauth may retry).
-			body := io.MultiReader(
-				bytes.NewReader(hdrBytes),
-				bytes.NewReader(curBuf[:need]),
-				strings.NewReader(closingBoundary),
-			)
-			req, err := http.NewRequest("POST", ne.BaseURL+"/api/file/upload?full=1", body)
-			if err != nil {
-				return nil, err
-			}
-			req.ContentLength = bodySize
-			req.Header.Set("Authorization", "Bearer "+token)
-			req.Header.Set("Content-Type", contentType)
-			return req, nil
-		}, false)
-		dt := time.Since(start)
-
-		// ── Handle HTTP errors ──
-		if err != nil {
-			fs.Debugf(nil, "uploadChunked(%q): HTTP error on chunk %d after %v: %v", fileName, idx, dt, err)
-
-			retryable := false
-			delay := 2 * time.Second
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				fs.Debugf(nil, "uploadChunked(%q): chunk %d network timeout, retrying", fileName, idx)
-				retryable = true
-			} else if strings.Contains(err.Error(), "connection reset") || strings.Contains(err.Error(), "broken pipe") {
-				fs.Debugf(nil, "uploadChunked(%q): chunk %d connection reset, retrying", fileName, idx)
-				retryable = true
-				delay = 3 * time.Second
-			}
-			if retryable {
-				drainReadAhead()
-				skipRead = true
-				idx--
-				time.Sleep(delay)
-				continue
-			}
-			return nil, err
-		}
-
-		// ── Read & process response ──
-		respBody, _ := io.ReadAll(resp.Body)
-		closeResponseBody(resp)
-		isSuccess := resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK
-		if len(respBody) > 0 && isSuccess {
-			fs.Debugf(nil, "uploadChunked(%q): chunk %d server response body: %s", fileName, idx, string(respBody))
-		} else if !isSuccess {
-			fs.Debugf(nil, "uploadChunked(%q): chunk %d error response body: %s", fileName, idx, string(respBody))
-		}
-
-		if isSuccess {
-			if missing, ok := parseChunkReportMissing(respBody); ok && missing <= idx {
-				fs.Debugf(nil, "uploadChunked(%q): server reports missing chunk %d while sending chunk %d – cannot rewind non-seekable reader, aborting", fileName, missing, idx)
-				drainReadAhead()
-				return nil, fmt.Errorf("server reports missing chunk %d but reader is not seekable", missing)
-			}
-
-			if idx == lastChunkIdx {
-				var fi APIFile
-				if err := json.Unmarshal(respBody, &fi); err == nil && fi.ID != 0 {
-					if fi.MD5 == "" && fi.Hash != "" {
-						fi.MD5 = fi.Hash
-					}
-					finalInfo = &fi
-					fs.Debugf(nil, "uploadChunked(%q): last chunk %d parsed response - id=%d creation=%v modification=%v", fileName, idx, fi.ID, fi.Creation, fi.Modification)
-					fs.Debugf(nil, "uploadChunked(%q): expected dates - creation=%v modification=%v", fileName, createdTime.UTC(), modTime.UTC())
-				}
-			}
-		}
-
-		if !isSuccess {
-			retryChunk := func(delay time.Duration) {
-				drainReadAhead()
-				skipRead = true
-				time.Sleep(delay)
-			}
-
-			switch resp.StatusCode {
-			case 400:
-				fs.Debugf(nil, "uploadChunked(%q): chunk %d failed with 400, retrying", fileName, idx)
-				retryChunk(0)
-				idx--
-				continue
-			case 404:
-				chunkRetries[idx]++
-				maxChunkRetries := 3
-				if chunkRetries[idx] > maxChunkRetries {
-					return nil, &httpErr{
-						code: resp.StatusCode,
-						body: fmt.Sprintf("chunk %d failed after %d retries", idx, maxChunkRetries),
-					}
-				}
-				delay := time.Duration(chunkRetries[idx]) * time.Second
-				fs.Debugf(nil, "uploadChunked(%q): chunk %d got 404, waiting %v (retry %d/%d)", fileName, idx, delay, chunkRetries[idx], maxChunkRetries)
-				retryChunk(delay)
-				idx--
-				continue
-			case 423:
-				chunkRetries[idx]++
-				maxChunkRetries := 3
-				if chunkRetries[idx] > maxChunkRetries {
-					fs.Debugf(nil, "uploadChunked(%q): chunk %d got 423 after %d retries - treating as successful", fileName, idx, maxChunkRetries)
-					continue
-				}
-				delay := time.Duration(chunkRetries[idx]) * 2 * time.Second
-				fs.Debugf(nil, "uploadChunked(%q): chunk %d got 423 - retry %d/%d", fileName, idx, chunkRetries[idx], maxChunkRetries)
-				retryChunk(delay)
-				idx--
-				continue
-			case 429:
-				chunkRetries[idx]++
-				maxChunkRetries := 5
-				if chunkRetries[idx] > maxChunkRetries {
-					fs.Debugf(nil, "uploadChunked(%q): chunk %d rate limited after %d retries - treating as successful", fileName, idx, maxChunkRetries)
-					continue
-				}
-				delay := time.Duration(chunkRetries[idx]) * 3 * time.Second
-				fs.Debugf(nil, "uploadChunked(%q): chunk %d rate limited (429), waiting %v (retry %d/%d)", fileName, idx, delay, chunkRetries[idx], maxChunkRetries)
-				retryChunk(delay)
-				idx--
-				continue
-			case 500:
-				chunkRetries[idx]++
-				maxChunkRetries := 3
-				if chunkRetries[idx] > maxChunkRetries {
-					fs.Debugf(nil, "uploadChunked(%q): chunk %d server error after %d retries - treating as successful", fileName, idx, maxChunkRetries)
-					continue
-				}
-				delay := time.Duration(chunkRetries[idx]) * 5 * time.Second
-				fs.Debugf(nil, "uploadChunked(%q): chunk %d got 500, waiting %v (retry %d/%d)", fileName, idx, delay, chunkRetries[idx], maxChunkRetries)
-				retryChunk(delay)
-				idx--
-				continue
-			default:
-				return nil, &httpErr{
-					code: resp.StatusCode,
-					body: fmt.Sprintf("chunk %d failed", idx),
-				}
-			}
-		}
-	}
-	drainReadAhead()
-	return finalInfo, nil
-}
-
-// --- helper for small uploads ---------------------------------------------
-
 // returns the metadata of the freshly-created file
-func (ne *NetExplorer) uploadSingle(folderID, fileName string, data io.Reader, modTime time.Time, createdTime time.Time) (*APIFile, error) {
-	url := ne.BaseURL + "/api/file/upload?full"
-	fs.Debugf(nil, "uploadSingle: POST %s (folderID=%s name=%q)", url, folderID, fileName)
+func (ne *NetExplorer) uploadSingle(ctx context.Context, folderID, fileName string, data io.Reader, fileSize int64, modTime time.Time, createdTime time.Time, sourceObject fs.Object) (*APIFile, error) {
+	uploadURL, err := url.Parse(ne.BaseURL + "/api/file/upload")
+	if err != nil {
+		return nil, fmt.Errorf("uploadSingle: invalid upload url: %w", err)
+	}
+
+	queryFields := map[string]string{}
+	query := uploadURL.Query()
+
+	// POST /file/upload expects creation/modification as query parameters.
+	if !modTime.IsZero() {
+		modTimeStr := modTime.UTC().Format(time.RFC3339)
+		query.Set("modification", modTimeStr)
+		queryFields["modification"] = modTimeStr
+		fs.Debugf(nil, "uploadSingle(%q): adding query modification=%q (UTC)", fileName, modTimeStr)
+	} else {
+		fs.Debugf(nil, "uploadSingle(%q): modTime is zero, not sending query modification", fileName)
+	}
+	if !createdTime.IsZero() {
+		createdTimeStr := createdTime.UTC().Format(time.RFC3339)
+		query.Set("creation", createdTimeStr)
+		queryFields["creation"] = createdTimeStr
+		fs.Debugf(nil, "uploadSingle(%q): adding query creation=%q (UTC)", fileName, createdTimeStr)
+	} else {
+		fs.Debugf(nil, "uploadSingle(%q): createdTime is zero, not sending query creation", fileName)
+	}
+	uploadURL.RawQuery = query.Encode()
+	fs.Debugf(nil, "uploadSingle: POST %s (folderID=%s name=%q)", uploadURL.String(), folderID, fileName)
+
+	// Compute fileHash before creating the multipart body so it can be sent
+	// alongside folderId/targetFile on direct uploads.
+	var fileHashHex string
+	var hashSource string
+	hashStart := time.Now()
+	if sourceObject != nil {
+		if h, err := sourceObject.Hash(ctx, hash.MD5); err == nil && h != "" {
+			fileHashHex = h
+			hashSource = "remote"
+		} else {
+			hashSource = "remote-unavailable"
+		}
+	} else if fileSize > 0 {
+		buf, err := io.ReadAll(data)
+		if err != nil {
+			return nil, fmt.Errorf("uploadSingle: failed to buffer data for hash: %w", err)
+		}
+		sum := md5.Sum(buf)
+		fileHashHex = hex.EncodeToString(sum[:])
+		data = bytes.NewReader(buf)
+		hashSource = "local"
+	} else {
+		hashSource = "skipped"
+	}
+	hashDt := time.Since(hashStart)
+	fs.Infof(nil, "[netexplorer] uploadSingle %q: hash=%s  hashMs=%dms  md5=%s",
+		fileName, hashSource, hashDt.Milliseconds(), fileHashHex)
 
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
@@ -3526,47 +4084,38 @@ func (ne *NetExplorer) uploadSingle(folderID, fileName string, data io.Reader, m
 
 	_ = mw.WriteField("folderId", folderID)
 
-	// Add modification time if available
-	if !modTime.IsZero() {
-		// Convert to UTC for consistency (ISO 8601 with Z)
-		modTimeUTC := modTime.UTC()
-		modTimeStr := modTimeUTC.Format(time.RFC3339)
-		_ = mw.WriteField("modification", modTimeStr)
-		formFields["modification"] = modTimeStr
-		fs.Debugf(nil, "uploadSingle(%q): adding modification=%q (UTC)", fileName, modTimeStr)
-	} else {
-		fs.Debugf(nil, "uploadSingle(%q): modTime is zero, not sending modification field", fileName)
+	if fileSize >= 0 {
+		_ = mw.WriteField("fileSize", strconv.FormatInt(fileSize, 10))
+		formFields["fileSize"] = strconv.FormatInt(fileSize, 10)
+	}
+	if fileHashHex != "" {
+		_ = mw.WriteField("fileHash", fileHashHex)
+		formFields["fileHash"] = fileHashHex
 	}
 
-	// Add creation time if available
-	if !createdTime.IsZero() {
-		// Convert to UTC for consistency (ISO 8601 with Z)
-		createdTimeUTC := createdTime.UTC()
-		createdTimeStr := createdTimeUTC.Format(time.RFC3339)
-		_ = mw.WriteField("creation", createdTimeStr)
-		formFields["creation"] = createdTimeStr
-		fs.Debugf(nil, "uploadSingle(%q): adding creation=%q (UTC)", fileName, createdTimeStr)
-	} else {
-		fs.Debugf(nil, "uploadSingle(%q): createdTime is zero, not sending creation field", fileName)
-	}
-
-	// Log request form fields (excluding file data)
-	fs.Debugf(nil, "uploadSingle(%q): request form fields: %v", fileName, formFields)
+	// Log request fields separately: folderId in multipart body, dates in query string.
+	fs.Debugf(nil, "uploadSingle(%q): request form fields=%v query fields=%v", fileName, formFields, queryFields)
 
 	part, err := mw.CreateFormFile("targetFile", fileName)
 	if err != nil {
 		return nil, err
 	}
-	if _, err = io.Copy(part, data); err != nil {
-		return nil, err
+	bufferStart := time.Now()
+	bytesCopied, copyErr := io.Copy(part, data)
+	if copyErr != nil {
+		return nil, copyErr
 	}
 	if err = mw.Close(); err != nil {
 		return nil, err
 	}
+	bufferDt := time.Since(bufferStart)
+	sizeMB := float64(bytesCopied) / (1024 * 1024)
+	fs.Infof(nil, "[netexplorer] uploadSingle %q: size=%.2f MB  buffer=%dms  body=%d B",
+		fileName, sizeMB, bufferDt.Milliseconds(), body.Len())
 
-	start := time.Now()
+	postStart := time.Now()
 	resp, err := ne.doRequestWithReauth(func(token string) (*http.Request, error) {
-		req, err := http.NewRequest("POST", url, &body)
+		req, err := http.NewRequest("POST", uploadURL.String(), &body)
 		if err != nil {
 			return nil, err
 		}
@@ -3574,13 +4123,21 @@ func (ne *NetExplorer) uploadSingle(folderID, fileName string, data io.Reader, m
 		req.Header.Set("Content-Type", mw.FormDataContentType())
 		return req, nil
 	}, false)
-	dt := time.Since(start)
+	postDt := time.Since(postStart)
 	if err != nil {
-		fs.Debugf(nil, "uploadSingle(%q): HTTP error after %v: %v", fileName, dt, err)
+		fs.Infof(nil, "[netexplorer] uploadSingle %q: POST error after %dms: %v", fileName, postDt.Milliseconds(), err)
 		return nil, err
 	}
 	defer closeResponseBody(resp)
-	fs.Debugf(nil, "uploadSingle(%q): status=%d in %v", fileName, resp.StatusCode, dt)
+	if timing := responseTimingHeaders(resp); timing != "" {
+		fs.Infof(nil, "[netexplorer] uploadSingle %q: POST=%dms  status=%d  %s  (%.2f MB/s)",
+			fileName, postDt.Milliseconds(), resp.StatusCode, timing,
+			sizeMB/(float64(postDt.Milliseconds())/1000))
+	} else {
+		fs.Infof(nil, "[netexplorer] uploadSingle %q: POST=%dms  status=%d  (%.2f MB/s)",
+			fileName, postDt.Milliseconds(), resp.StatusCode,
+			sizeMB/(float64(postDt.Milliseconds())/1000))
+	}
 
 	// Read response body for logging
 	bodyBytes, _ := io.ReadAll(resp.Body)
@@ -3612,7 +4169,18 @@ func (ne *NetExplorer) uploadSingle(folderID, fileName string, data io.Reader, m
 	if fi.MD5 == "" && fi.Hash != "" {
 		fi.MD5 = fi.Hash
 	}
-	fs.Debugf(nil, "uploadSingle(%q): parsed response - id=%d size=%d md5=%q creation=%v modification=%v", fileName, fi.ID, fi.Size, fi.MD5, fi.Creation, fi.Modification)
+
+	// Direct uploads usually return the final metadata, so only issue a
+	// corrective PUT when the server clearly ignored the requested creation time.
+	if !createdTime.IsZero() && !timesWithinTolerance(fi.Creation, createdTime, 2*time.Second) {
+		updatedInfo, err := ne.updateFileMetadata(strconv.Itoa(fi.ID), modTime, createdTime)
+		if err != nil {
+			fs.Infof(nil, "[netexplorer] uploadSingle %q: PUT correction failed: %v", fileName, err)
+		} else if updatedInfo != nil {
+			fi = *updatedInfo
+		}
+	}
+
 	return &fi, nil
 }
 
@@ -3772,8 +4340,8 @@ func (ne *NetExplorer) ListFiles(fileID string) ([]APIFile, error) {
 
 // ListFolder lists both folders and files under folderID.
 // It handles both API shapes:
-//  1. GET /api/folder/{id}?depth=1 → raw []FolderObject
-//  2. GET /api/folders?parent_id={id} → []{ content: { folders:…, files:… } }
+//  1. GET /api/folder/{id}?depth=1 â†’ raw []FolderObject
+//  2. GET /api/folders?parent_id={id} â†’ []{ content: { folders:â€¦, files:â€¦ } }
 func (ne *NetExplorer) ListFolder(folderID string) ([]APIFolder, []APIFile, error) {
 	url := fmt.Sprintf("%s/api/folder/%s?depth=1", ne.BaseURL, folderID)
 	fs.Debugf(nil, "ListFolder: GET %s", url)
@@ -3807,9 +4375,9 @@ func (ne *NetExplorer) ListFolder(folderID string) ([]APIFolder, []APIFile, erro
 	if len(trimmed) > 0 && trimmed[0] == '[' {
 		var folders []APIFolder
 		if err := json.Unmarshal(raw, &folders); err != nil {
-			return nil, nil, fmt.Errorf("unmarshal raw-folder-array: %w — raw: %s", err, raw)
+			return nil, nil, fmt.Errorf("unmarshal raw-folder-array: %w â€” raw: %s", err, raw)
 		}
-		fs.Debugf(nil, "ListFolder(%s): shape=array → folders=%d files=0", folderID, len(folders))
+		fs.Debugf(nil, "ListFolder(%s): shape=array â†’ folders=%d files=0", folderID, len(folders))
 		return folders, nil, nil
 	}
 
@@ -3820,9 +4388,9 @@ func (ne *NetExplorer) ListFolder(folderID string) ([]APIFolder, []APIFile, erro
 		} `json:"content"`
 	}
 	if err := json.Unmarshal(raw, &wrapper); err != nil {
-		return nil, nil, fmt.Errorf("unmarshal wrapper content: %w — raw: %s", err, raw)
+		return nil, nil, fmt.Errorf("unmarshal wrapper content: %w â€” raw: %s", err, raw)
 	}
-	fs.Debugf(nil, "ListFolder(%s): shape=wrapper → folders=%d files=%d",
+	fs.Debugf(nil, "ListFolder(%s): shape=wrapper â†’ folders=%d files=%d",
 		folderID, len(wrapper.Content.Folders), len(wrapper.Content.Files))
 	return wrapper.Content.Folders, wrapper.Content.Files, nil
 }
@@ -3865,13 +4433,13 @@ func (ne *NetExplorer) ListFolderWithDepth(folderID string, depth int) ([]APIFol
 		} `json:"content"`
 	}
 	if err := json.Unmarshal(raw, &root); err != nil {
-		return nil, nil, fmt.Errorf("unmarshal depth response: %w — raw: %s", err, raw)
+		return nil, nil, fmt.Errorf("unmarshal depth response: %w â€” raw: %s", err, raw)
 	}
 
 	// For bulk operations, we need to flatten the nested structure
 	allFolders, allFiles := ne.flattenDepthResponse(root.Content.Folders, root.Content.Files)
 
-	fs.Debugf(nil, "ListFolderWithDepth(%s, depth=%d): flattened → folders=%d files=%d",
+	fs.Debugf(nil, "ListFolderWithDepth(%s, depth=%d): flattened â†’ folders=%d files=%d",
 		folderID, depth, len(allFolders), len(allFiles))
 	return allFolders, allFiles, nil
 }
@@ -3894,70 +4462,8 @@ func (ne *NetExplorer) flattenDepthResponse(folders []APIFolder, files []APIFile
 	return allFolders, allFiles
 }
 
-// ListFolderByPath does one HTTP call to fetch the tree under rootID,
-// then walks down pathSegments and returns just the final folder's content.
-func (ne *NetExplorer) ListFolderByPath(rootID string, pathSegments []string) (folders []folderNode, files []APIFile, err error) {
-	depth := len(pathSegments) + 1
-	url := fmt.Sprintf("%s/api/folder/%s?depth=%d&full=1", ne.BaseURL, rootID, depth)
-	fs.Debugf(nil, "ListFolderByPath: GET %s (segments=%v)", url, pathSegments)
-
-	start := time.Now()
-	resp, err := ne.doRequestWithReauth(func(token string) (*http.Request, error) {
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Authorization", "Bearer "+token)
-		return req, nil
-	}, false)
-	dt := time.Since(start)
-	if err != nil {
-		fs.Debugf(nil, "ListFolderByPath: HTTP error after %v: %v", dt, err)
-		return nil, nil, err
-	}
-	defer closeResponseBody(resp)
-	fs.Debugf(nil, "ListFolderByPath: status=%d in %v", resp.StatusCode, dt)
-
-	var root struct {
-		Content struct {
-			Folders []folderNode `json:"folders"`
-		} `json:"content"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&root); err != nil {
-		fs.Debugf(nil, "ListFolderByPath: JSON decode error: %v", err)
-		return nil, nil, err
-	}
-
-	nodes := root.Content.Folders
-	for i, seg := range pathSegments {
-		fs.Debugf(nil, "ListFolderByPath: descend %d/%d into %q", i+1, len(pathSegments), seg)
-		var found bool
-		for _, n := range nodes {
-			if n.Name == seg {
-				nodes = n.Content.Folders
-				if i == len(pathSegments)-1 {
-					folders = n.Content.Folders
-					files = n.Content.Files
-				}
-				found = true
-				break
-			}
-		}
-		if !found {
-			fs.Debugf(nil, "ListFolderByPath: segment %q not found", seg)
-			return nil, nil, fmt.Errorf("directory %q not found", seg)
-		}
-	}
-
-	if len(pathSegments) == 0 {
-		folders = append(folders, root.Content.Folders...)
-	}
-	fs.Debugf(nil, "ListFolderByPath: result folders=%d files=%d", len(folders), len(files))
-	return folders, files, nil
-}
-
 // ---------------------------------------------------------------------
-// resolveFolderID walks rootID → initialPath → dir to get a numeric ID
+// resolveFolderID walks rootID â†’ initialPath â†’ dir to get a numeric ID
 // ---------------------------------------------------------------------
 
 func (f *Fs) resolveFolderID(ctx context.Context, dir string) (string, error) {
@@ -4042,8 +4548,15 @@ segmentsLoop:
 			// Instead of racing and potentially creating duplicates, wait for it
 			// to finish and rely on its result. If we still cannot see the folder
 			// after several attempts, bubble up an error so the caller can retry
-			// the whole operation rather than blindly creating "name (1)", "(2)", …
-			for attempts := 0; attempts < 5; attempts++ {
+			// the whole operation rather than blindly creating "name (1)", "(2)", â€¦
+			waitAttempts := 30
+			if f.opt.FolderDelay > 0 {
+				delayAttempts := (f.opt.FolderDelay / 100) + 10
+				if delayAttempts > waitAttempts {
+					waitAttempts = delayAttempts
+				}
+			}
+			for attempts := 0; attempts < waitAttempts; attempts++ {
 				time.Sleep(100 * time.Millisecond)
 				key := "list:" + parentID
 				_, listErr, _ := f.listSF.Do(key, func() (any, error) {
@@ -4060,25 +4573,14 @@ segmentsLoop:
 			}
 
 			// At this point we still don't see the folder in our index, even after
-			// repeatedly hydrating the parent. This can happen if the other goroutine
-			// failed its CreateFolder call or if the remote API is being very slow to
-			// reflect the new folder in listings.
+			// repeatedly hydrating the parent. Do NOT attempt a second CreateFolder
+			// here: with NetExplorer's eventual consistency that is exactly what can
+			// turn one legitimate folder into "name (1)" / "name (2)" fragmentation.
 			//
-			// Rather than failing the whole transfer (which makes it look like the
-			// copy ran twice when rclone retries), fall back to performing a *single*
-			// guarded CreateFolder attempt ourselves. Any true "already exists" or
-			// auto‑rename situations will be surfaced by CreateFolder() as conflicts
-			// and handled via the hydration path below, so this does not re‑introduce
-			// the BE_CAP(1)/(2) fragmentation bug.
-
-			fs.Debugf(f, "ensureFolderID: folder %q still not visible after waiting for concurrent creator; attempting a guarded CreateFolder ourselves", fullPath)
-
-			// Mark ourselves as the creator for this fullPath while we attempt
-			// the creation to avoid additional local races.
-			f.batchMu.Lock()
-			f.folderBatch[fullPath] = true
-			f.batchMu.Unlock()
-			// and then fall through into the normal creation path below
+			// Returning an error here is preferable to creating a duplicate. The
+			// caller/rclone retry loop can safely re-run the operation once the
+			// original creator becomes visible in listings.
+			return "", fmt.Errorf("ensureFolderID: concurrent creation for %q under parent %s not visible after waiting", fullPath, parentID)
 		}
 
 		// Check for pending folder dates (from MkdirMetadata/DirSetModTime), keyed by fullPath.
@@ -4155,7 +4657,7 @@ segmentsLoop:
 			continue
 		}
 
-		// Still not found – this means something is inconsistent on the server side.
+		// Still not found â€“ this means something is inconsistent on the server side.
 		return "", fmt.Errorf("ensureFolderID: folder %q under parent %s not found after creation", fullPath, parentID)
 	}
 
@@ -4221,7 +4723,7 @@ func (rs *RenameSummary) PrintSummary() {
 
 	for _, original := range keys {
 		sanitized := renames[original]
-		fs.Infof(nil, "  %q → %q", original, sanitized)
+		fs.Infof(nil, "  %q â†’ %q", original, sanitized)
 	}
 
 	fs.Infof(nil, "Total renames: %d", len(renames))
