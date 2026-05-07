@@ -69,6 +69,7 @@ type endpointMetrics struct {
 type httpCallStats struct {
 	mu         sync.Mutex
 	byEndpoint map[string]*endpointMetrics
+	byHeader   map[string]*endpointMetrics
 	lastLog    time.Time
 }
 
@@ -92,33 +93,71 @@ func normalizeURLKey(method string, u *url.URL) string {
 	return method + " " + strings.Join(parts, "/")
 }
 
-func (s *httpCallStats) record(method string, u *url.URL, ms int64) {
+var trackedResponseHeaders = []string{
+	"X-NE-ExecTime",
+	"X-NE-EndpointExecTime",
+	"X-NE-SQLExecTime",
+	"X-NE-SQLReqCount",
+	"X-NE-RedisExecTime",
+	"X-NE-NatsExecTime",
+	"X-NE-FSExecTime",
+	"X-NE-FSExecCount",
+	"X-NE-BootTime",
+}
+
+func (s *httpCallStats) recordOne(m map[string]*endpointMetrics, key string, ms int64) {
+	ep, ok := m[key]
+	if !ok {
+		ep = &endpointMetrics{minMs: ms, maxMs: ms}
+		m[key] = ep
+	}
+	ep.count++
+	ep.totalMs += ms
+	if ms < ep.minMs {
+		ep.minMs = ms
+	}
+	if ms > ep.maxMs {
+		ep.maxMs = ms
+	}
+}
+
+func (s *httpCallStats) record(method string, u *url.URL, ms int64, resp *http.Response) {
 	key := normalizeURLKey(method, u)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	m, ok := s.byEndpoint[key]
-	if !ok {
-		m = &endpointMetrics{minMs: ms, maxMs: ms}
-		s.byEndpoint[key] = m
-	}
-	m.count++
-	m.totalMs += ms
-	if ms < m.minMs {
-		m.minMs = ms
-	}
-	if ms > m.maxMs {
-		m.maxMs = ms
+	s.recordOne(s.byEndpoint, key, ms)
+	if resp != nil {
+		for _, h := range trackedResponseHeaders {
+			if raw := strings.TrimSpace(resp.Header.Get(h)); raw != "" {
+				if v, err := strconv.ParseInt(raw, 10, 64); err == nil {
+					s.recordOne(s.byHeader, h, v)
+				}
+			}
+		}
 	}
 	if time.Since(s.lastLog) >= 10*time.Second || s.lastLog.IsZero() {
 		for k, ep := range s.byEndpoint {
 			fs.Infof(nil, "[netexplorer] HTTP %-38s count=%4d  mean=%5dms  min=%5dms  max=%5dms",
 				k, ep.count, ep.totalMs/ep.count, ep.minMs, ep.maxMs)
 		}
+		for h, ep := range s.byHeader {
+			fs.Infof(nil, "[netexplorer] HDR %-38s count=%4d  mean=%5d  min=%5d  max=%5d",
+				h, ep.count, ep.totalMs/ep.count, ep.minMs, ep.maxMs)
+		}
 		s.lastLog = time.Now()
 	}
 }
 
-var globalHTTPStats = &httpCallStats{byEndpoint: make(map[string]*endpointMetrics)}
+var globalHTTPStats = &httpCallStats{
+	byEndpoint: make(map[string]*endpointMetrics),
+	byHeader:   make(map[string]*endpointMetrics),
+}
+
+func uploadStickyToken(fileSize int64, fileName string) string {
+	raw := strconv.FormatInt(fileSize, 10) + ":" + fileName
+	sum := md5.Sum([]byte(raw))
+	return hex.EncodeToString(sum[:])
+}
 
 // NetExplorer is the API client
 type NetExplorer struct {
@@ -388,10 +427,15 @@ func responseTimingHeaders(resp *http.Response) string {
 
 	headers := []string{
 		"X-NE-ExecTime",
+		"X-NE-EndpointExecTime",
 		"X-NE-SQLExecTime",
 		"X-NE-SQLReqCount",
 		"X-NE-RedisExecTime",
 		"X-NE-NatsExecTime",
+		"X-NE-FSExecTime",
+		"X-NE-FSExecCount",
+		"X-NE-BootTime",
+		"X-NE-Node",
 	}
 	parts := make([]string, 0, len(headers))
 	for _, name := range headers {
@@ -480,10 +524,10 @@ func (ne *NetExplorer) doRequestWithReauth(buildReq func(token string) (*http.Re
 		dt := time.Since(start)
 		ms := dt.Milliseconds()
 		if err != nil {
-			fs.Debugf(nil, "[netexplorer] HTTP %s %s â†’ error in %dms: %v", req.Method, req.URL.Path, ms, err)
+			fs.Debugf(nil, "[netexplorer] HTTP %s %s -> error in %dms: %v", req.Method, req.URL.Path, ms, err)
 		} else {
-			fs.Debugf(nil, "[netexplorer] HTTP %s %s â†’ %d in %dms", req.Method, req.URL.Path, resp.StatusCode, ms)
-			globalHTTPStats.record(req.Method, req.URL, ms)
+			fs.Debugf(nil, "[netexplorer] HTTP %s %s -> %d in %dms", req.Method, req.URL.Path, resp.StatusCode, ms)
+			globalHTTPStats.record(req.Method, req.URL, ms, resp)
 		}
 		return resp, err
 	}
@@ -916,13 +960,13 @@ func isAlreadyExists(err error) bool {
 		// NetExplorer may signal "already exists" with several status codes:
 		// - 409/422: explicit conflict / unprocessable entity
 		// - 403: in practice sometimes returned with a body like
-		//   {"error":"Un Ã©lÃ©ment du mÃªme nom existe dÃ©jÃ . Veuillez saisir un nom diffÃ©rent."}
+		//   {"error":"Un element du meme nom existe deja. Veuillez saisir un nom different."}
 		if he.code == http.StatusConflict || he.code == 422 {
 			return true
 		}
 		if he.code == http.StatusForbidden &&
 			(strings.Contains(he.body, "m\\u00eame nom existe d\\u00e9j\\u00e0") ||
-				strings.Contains(he.body, "mÃªme nom existe dÃ©jÃ ")) {
+				strings.Contains(he.body, "m\u00eame nom existe d\u00e9j\u00e0")) {
 			return true
 		}
 	}
@@ -984,6 +1028,31 @@ func (f *Fs) idxDelFolder(p string) {
 		}()
 	}
 }
+// evictFolderPathsSync removes the given logical paths from all cache layers
+// (hot, legacy map, Bolt) in a single synchronous Bolt transaction.
+// Use this when the caller must be certain the eviction is complete before the
+// next cache read — e.g. in NewFs before ensureFolderID, where an async goroutine
+// would create a race that re-promotes stale Bolt values back into the hot cache.
+func (f *Fs) evictFolderPathsSync(paths ...string) {
+	for _, p := range paths {
+		f.hot.Delete("p:" + f.kpath(p))
+		f.cacheDelete(p)
+	}
+	if f.kv == nil {
+		return
+	}
+	_ = f.kv.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(bucketFolders)
+		if b == nil {
+			return nil
+		}
+		for _, p := range paths {
+			_ = b.Delete([]byte(p))
+		}
+		return nil
+	})
+}
+
 func kf(parentID, name string) string { return parentID + "|" + name }
 func (f *Fs) idxGetFile(parentID, name string) (string, bool) {
 	key := "f:" + kf(parentID, name)
@@ -1363,9 +1432,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		hashes:      hash.NewHashSet(hash.MD5),
 	}
 
-	// If root not set, prompt now â€” we need it before naming the cache file
+	// If root not set, prompt now - we need it before naming the cache file
 	if f.rootID == "" {
-		fs.Debugf(f, "NewFs: no rootID configured, invoking ensureRoot() â€¦")
+		fs.Debugf(f, "NewFs: no rootID configured, invoking ensureRoot()...")
 		if err := f.ensureRoot(ctx); err != nil {
 			return nil, err
 		}
@@ -1433,11 +1502,24 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		// If initialPath is non-empty (e.g. "netexplorer:some/sub/folder"),
 		// then the logical rclone root "" should correspond to that subfolder,
 		// not to the absolute API rootID. In that case we resolve the
-		// effective root folder ID now so that List(""), NewObject("â€¦"),
+		// effective root folder ID now so that List(""), NewObject("..."),
 		// NeedTransfer, etc. all see the correct tree.
 		if len(f.initialPath) == 0 {
 			f.idxPutFolder("", f.rootID)
 		} else {
+			// Evict all cached initialPath entries SYNCHRONOUSLY before resolving so
+			// that a stale Bolt ID from a previous run cannot bypass the server lookup.
+			// idxDelFolder writes Bolt asynchronously via a goroutine; if we called it
+			// here the goroutine might not have run yet when ensureFolderID reads Bolt,
+			// which would re-promote the stale ID back into the hot cache.
+			// One synchronous Bolt.Update transaction + hot/legacy deletions avoids the race.
+			evictPaths := make([]string, 0, len(f.initialPath)+1)
+			evictPaths = append(evictPaths, "")
+			for i := range f.initialPath {
+				evictPaths = append(evictPaths, strings.Join(f.initialPath[:i+1], "/"))
+			}
+			f.evictFolderPathsSync(evictPaths...)
+
 			if _, err := f.ensureFolderID(ctx, "", false); err != nil {
 				fs.Debugf(f, "NewFs: ensureFolderID(\"\", create=false) failed for initialPath %v: %v", f.initialPath, err)
 				// Non-fatal: if this fails, later operations will fall back to
@@ -1534,7 +1616,7 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	}
 
 	// Fallback to API call only if not in cache
-	fs.Debugf(o.fs, "Hash(%q): md5 not cached, calling GetFile(id=%d)â€¦", o.remote, o.id)
+	fs.Debugf(o.fs, "Hash(%q): md5 not cached, calling GetFile(id=%d)...", o.remote, o.id)
 	info, err := o.fs.ne.GetFile(strconv.Itoa(o.id))
 	if err != nil {
 		fs.Debugf(o.fs, "Hash(%q): GetFile error: %v", o.remote, err)
@@ -1567,7 +1649,7 @@ func joinPath(dir, name string) string {
 
 // ensureRoot checks and prompts the user if the configured root is empty or invalid
 func (f *Fs) ensureRoot(ctx context.Context) error {
-	fs.Debugf(f, "ensureRoot: prompting user to pick a root folder â€¦")
+	fs.Debugf(f, "ensureRoot: prompting user to pick a root folder...")
 	fmt.Println("No root folder configured. Please select one:")
 
 	start := time.Now()
@@ -1613,7 +1695,7 @@ func (f *Fs) ensureRoot(ctx context.Context) error {
 		if valid[choice] {
 			break
 		}
-		fmt.Println("â¨¯ Invalid ID, please enter one of the IDs listed above.")
+		fmt.Println("Invalid ID, please enter one of the IDs listed above.")
 	}
 
 	// 4) Save and set
@@ -1648,17 +1730,18 @@ func (ne *NetExplorer) ListRoots() ([]APIFolder, error) {
 	defer closeResponseBody(resp)
 	fs.Debugf(nil, "ListRoots: status=%d in %v", resp.StatusCode, dt)
 
-	// mirror original behavior of re-reading body
 	b, _ := io.ReadAll(resp.Body)
 	fs.Debugf(nil, "ListRoots: body bytes=%d", len(b))
-	resp.Body = io.NopCloser(bytes.NewBuffer(b))
+	if resp.StatusCode != http.StatusOK {
+		return nil, &httpErr{code: resp.StatusCode, body: string(b)}
+	}
 
 	var items []struct {
 		ID   *int `json:"id"`
 		Name string
 		Type string
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
+	if err := json.Unmarshal(b, &items); err != nil {
 		fs.Debugf(nil, "ListRoots: JSON decode error: %v", err)
 		return nil, err
 	}
@@ -2579,7 +2662,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 	parentID := o.parentID
 	if parentID == "" {
-		fs.Debugf(o.fs, "Update(%q): parentID not set, resolvingâ€¦", relPath)
+		fs.Debugf(o.fs, "Update(%q): parentID not set, resolving...", relPath)
 		var err error
 		parentID, err = o.fs.ensureFolderID(ctx, dir, true)
 		if err != nil {
@@ -2749,15 +2832,21 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 				fs.Debugf(o.fs, "Update(%q): filename contains invalid characters (422), not retrying", relPath)
 				return fmt.Errorf("filename contains invalid characters: %w", err)
 			case 404:
-				// Directory not found - clear cache and retry ONCE
+				// Directory not found - stale Bolt cache or folder deleted server-side.
+				// Evict the dir alias AND all initialPath segments so that
+				// ensureFolderID is forced to re-hydrate from the server.
 				if attempt < maxRetries {
-					fs.Debugf(o.fs, "Update(%q): attempt %d/%d - detected 404 error, clearing cache for dir=%q and retrying", relPath, attempt+1, maxRetries, dir)
+					fs.Infof(o.fs, "Update(%q): attempt %d/%d - 404 on upload, evicting stale cache for dir=%q and re-resolving", relPath, attempt+1, maxRetries, dir)
 					o.fs.idxDelFolder(dir)
+					for i := range o.fs.initialPath {
+						o.fs.idxDelFolder(strings.Join(o.fs.initialPath[:i+1], "/"))
+					}
 					time.Sleep(baseDelay)
 
-					// Re-resolve the folder ID
+					// Use ensureFolderID with create=true: hydrates from server first;
+					// only creates the folder if it truly doesn't exist anymore.
 					var resolveErr error
-					parentID, resolveErr = o.fs.resolveFolderID(ctx, dir)
+					parentID, resolveErr = o.fs.ensureFolderID(ctx, dir, true)
 					if resolveErr != nil {
 						return resolveErr
 					}
@@ -3014,7 +3103,7 @@ func (ne *NetExplorer) CreateFolder(parentID, name string, modTime time.Time, cr
 		// Prefer parsing as APIFolder to inspect the returned name and dates.
 		var af APIFolder
 		if err := json.Unmarshal(bodyBytes, &af); err == nil && af.ID != 0 {
-			// NetExplorer sometimes auto-renames on conflict, e.g. "BE_CAP" â†’ "BE_CAP (1)".
+			// NetExplorer sometimes auto-renames on conflict, e.g. "BE_CAP" -> "BE_CAP (1)".
 			// Those should NOT be treated as the canonical folder for "name", otherwise
 			// rclone will happily use "name (1)" / "name (2)" as if they were "name".
 			//
@@ -3027,7 +3116,7 @@ func (ne *NetExplorer) CreateFolder(parentID, name string, modTime time.Time, cr
 				fs.Debugf(nil, "CreateFolder(%q): server returned different name %q (id=%d); treating as an \"already exists\" conflict and cleaning up auto-renamed folder", name, af.Name, af.ID)
 
 				// Best-effort cleanup: delete the auto-renamed folder we just caused
-				// the server to create, so that "name (1)", "name (2)", â€¦ do not
+				// the server to create, so that "name (1)", "name (2)", ... do not
 				// accumulate in the user's tree. The canonical folder for "name"
 				// (created earlier by us or by another client) remains untouched.
 				go func(id int, reqName, actualName string) {
@@ -3805,7 +3894,7 @@ uploadSession:
 }
 
 // UploadFile uploads data into folderID.
-// If fileSize â‰¤ 16 MiB it uses the classic one-shot endpoint.
+// If fileSize <= 16 MiB it uses the classic one-shot endpoint.
 // Otherwise it streams the file in 16 MiB blocks with the
 //
 //	chunk / chunks / chunksSize / fileSize protocol required by NetExplorer.
@@ -3814,14 +3903,14 @@ uploadSession:
 // NOTE: this keeps the "pre-fix" behavior you showed (targetPath = base name).
 func (ne *NetExplorer) streamInit(folderID, targetPath string, size int64, modTime time.Time, createdTime time.Time) (string, *APIFile, error) {
 	url := ne.BaseURL + "/api/file/upload"
-	// NOTE (pre-fix): send only the base name â†’ server places it at root.
+	// NOTE (pre-fix): send only the base name -> server places it at root.
 	base := path.Base(targetPath)
 	fs.Debugf(nil, "STREAM_INIT: POST %s folder=%s targetPath=%q size=%d method=stream", url, folderID, base, size)
 
 	payload := map[string]any{
 		"fileSize":     size,
 		"folderId":     folderID,
-		"targetPath":   base, // <â€” old behavior (server may ignore folderId for stream pathing)
+		"targetPath":   base, // old behavior (server may ignore folderId for stream pathing)
 		"uploadMethod": "stream",
 	}
 
@@ -3871,7 +3960,7 @@ func (ne *NetExplorer) streamInit(folderID, targetPath string, size int64, modTi
 	var generic map[string]any
 	if err := json.Unmarshal(raw, &generic); err == nil {
 		if sk, ok := generic["sessionKey"].(string); ok && sk != "" {
-			fs.Debugf(nil, "STREAM_INIT: received sessionKey=%sâ€¦", sk[:4]+"â€¦")
+			fs.Debugf(nil, "STREAM_INIT: received sessionKey=%s...", sk[:4]+"...")
 			return sk, nil, nil
 		}
 		if _, hasID := generic["id"]; hasID {
@@ -3967,7 +4056,7 @@ func (ne *NetExplorer) putStream(sessionKey string, data io.Reader, size int64) 
 		fs.Debugf(nil, "PUT_STREAM: parsed response - id=%d name=%q size=%d md5=%q creation=%v modification=%v", fi.ID, fi.Name, fi.Size, fi.MD5, fi.Creation, fi.Modification)
 		return &fi, nil
 	}
-	// No JSON body â†’ caller will hydrate later
+	// No JSON body -> caller will hydrate later
 	fs.Debugf(nil, "PUT_STREAM: no JSON metadata returned; will rely on hydrate to find id")
 	return nil, nil
 }
@@ -4054,9 +4143,9 @@ func (ne *NetExplorer) uploadSingle(ctx context.Context, folderID, fileName stri
 	if sourceObject != nil {
 		if h, err := sourceObject.Hash(ctx, hash.MD5); err == nil && h != "" {
 			fileHashHex = h
-			hashSource = "remote"
+			hashSource = "source-object" // free metadata for remote providers; file read for local fs
 		} else {
-			hashSource = "remote-unavailable"
+			hashSource = "source-object-unavailable"
 		}
 	} else if fileSize > 0 {
 		buf, err := io.ReadAll(data)
@@ -4121,6 +4210,9 @@ func (ne *NetExplorer) uploadSingle(ctx context.Context, folderID, fileName stri
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Content-Type", mw.FormDataContentType())
+		if fileSize >= 0 {
+			req.Header.Set("X-LB-Sticky-Token", uploadStickyToken(fileSize, fileName))
+		}
 		return req, nil
 	}, false)
 	postDt := time.Since(postStart)
@@ -4340,8 +4432,8 @@ func (ne *NetExplorer) ListFiles(fileID string) ([]APIFile, error) {
 
 // ListFolder lists both folders and files under folderID.
 // It handles both API shapes:
-//  1. GET /api/folder/{id}?depth=1 â†’ raw []FolderObject
-//  2. GET /api/folders?parent_id={id} â†’ []{ content: { folders:â€¦, files:â€¦ } }
+//  1. GET /api/folder/{id}?depth=1 -> raw []FolderObject
+//  2. GET /api/folders?parent_id={id} -> []{ content: { folders:..., files:... } }
 func (ne *NetExplorer) ListFolder(folderID string) ([]APIFolder, []APIFile, error) {
 	url := fmt.Sprintf("%s/api/folder/%s?depth=1", ne.BaseURL, folderID)
 	fs.Debugf(nil, "ListFolder: GET %s", url)
@@ -4370,14 +4462,17 @@ func (ne *NetExplorer) ListFolder(folderID string) ([]APIFolder, []APIFile, erro
 		return nil, nil, err
 	}
 	fs.Debugf(nil, "ListFolder(%s): body bytes=%d", folderID, len(raw))
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, &httpErr{code: resp.StatusCode, body: string(raw)}
+	}
 
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) > 0 && trimmed[0] == '[' {
 		var folders []APIFolder
 		if err := json.Unmarshal(raw, &folders); err != nil {
-			return nil, nil, fmt.Errorf("unmarshal raw-folder-array: %w â€” raw: %s", err, raw)
+			return nil, nil, fmt.Errorf("unmarshal raw-folder-array: %w - raw: %s", err, raw)
 		}
-		fs.Debugf(nil, "ListFolder(%s): shape=array â†’ folders=%d files=0", folderID, len(folders))
+		fs.Debugf(nil, "ListFolder(%s): shape=array -> folders=%d files=0", folderID, len(folders))
 		return folders, nil, nil
 	}
 
@@ -4388,9 +4483,9 @@ func (ne *NetExplorer) ListFolder(folderID string) ([]APIFolder, []APIFile, erro
 		} `json:"content"`
 	}
 	if err := json.Unmarshal(raw, &wrapper); err != nil {
-		return nil, nil, fmt.Errorf("unmarshal wrapper content: %w â€” raw: %s", err, raw)
+		return nil, nil, fmt.Errorf("unmarshal wrapper content: %w - raw: %s", err, raw)
 	}
-	fs.Debugf(nil, "ListFolder(%s): shape=wrapper â†’ folders=%d files=%d",
+	fs.Debugf(nil, "ListFolder(%s): shape=wrapper -> folders=%d files=%d",
 		folderID, len(wrapper.Content.Folders), len(wrapper.Content.Files))
 	return wrapper.Content.Folders, wrapper.Content.Files, nil
 }
@@ -4424,6 +4519,9 @@ func (ne *NetExplorer) ListFolderWithDepth(folderID string, depth int) ([]APIFol
 		return nil, nil, err
 	}
 	fs.Debugf(nil, "ListFolderWithDepth(%s, depth=%d): body bytes=%d", folderID, depth, len(raw))
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, &httpErr{code: resp.StatusCode, body: string(raw)}
+	}
 
 	// Parse the response - with depth > 1, we expect a nested structure
 	var root struct {
@@ -4433,13 +4531,13 @@ func (ne *NetExplorer) ListFolderWithDepth(folderID string, depth int) ([]APIFol
 		} `json:"content"`
 	}
 	if err := json.Unmarshal(raw, &root); err != nil {
-		return nil, nil, fmt.Errorf("unmarshal depth response: %w â€” raw: %s", err, raw)
+		return nil, nil, fmt.Errorf("unmarshal depth response: %w - raw: %s", err, raw)
 	}
 
 	// For bulk operations, we need to flatten the nested structure
 	allFolders, allFiles := ne.flattenDepthResponse(root.Content.Folders, root.Content.Files)
 
-	fs.Debugf(nil, "ListFolderWithDepth(%s, depth=%d): flattened â†’ folders=%d files=%d",
+	fs.Debugf(nil, "ListFolderWithDepth(%s, depth=%d): flattened -> folders=%d files=%d",
 		folderID, depth, len(allFolders), len(allFiles))
 	return allFolders, allFiles, nil
 }
@@ -4463,7 +4561,7 @@ func (ne *NetExplorer) flattenDepthResponse(folders []APIFolder, files []APIFile
 }
 
 // ---------------------------------------------------------------------
-// resolveFolderID walks rootID â†’ initialPath â†’ dir to get a numeric ID
+// resolveFolderID walks rootID -> initialPath -> dir to get a numeric ID
 // ---------------------------------------------------------------------
 
 func (f *Fs) resolveFolderID(ctx context.Context, dir string) (string, error) {
@@ -4548,7 +4646,7 @@ segmentsLoop:
 			// Instead of racing and potentially creating duplicates, wait for it
 			// to finish and rely on its result. If we still cannot see the folder
 			// after several attempts, bubble up an error so the caller can retry
-			// the whole operation rather than blindly creating "name (1)", "(2)", â€¦
+			// the whole operation rather than blindly creating "name (1)", "(2)", ...
 			waitAttempts := 30
 			if f.opt.FolderDelay > 0 {
 				delayAttempts := (f.opt.FolderDelay / 100) + 10
@@ -4657,7 +4755,7 @@ segmentsLoop:
 			continue
 		}
 
-		// Still not found â€“ this means something is inconsistent on the server side.
+		// Still not found - this means something is inconsistent on the server side.
 		return "", fmt.Errorf("ensureFolderID: folder %q under parent %s not found after creation", fullPath, parentID)
 	}
 
@@ -4723,7 +4821,7 @@ func (rs *RenameSummary) PrintSummary() {
 
 	for _, original := range keys {
 		sanitized := renames[original]
-		fs.Infof(nil, "  %q â†’ %q", original, sanitized)
+		fs.Infof(nil, "  %q -> %q", original, sanitized)
 	}
 
 	fs.Infof(nil, "Total renames: %d", len(renames))
