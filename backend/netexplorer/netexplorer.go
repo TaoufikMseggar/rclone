@@ -2886,7 +2886,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 				// Server error - retry with exponential backoff
 				if attempt < maxRetries {
 					delay := time.Duration(float64(baseDelay) * math.Pow(2, float64(attempt)))
-					fs.Debugf(o.fs, "Update(%q): server error (500), waiting %v (attempt %d/%d)", relPath, delay, attempt+1, maxRetries)
+					fs.Infof(o.fs, "Update(%q): server error (500) attempt %d/%d, waiting %v: %v", relPath, attempt+1, maxRetries, delay, err)
 					time.Sleep(delay)
 					if rewindErr := o.rewindUploadReader(in, err); rewindErr != nil {
 						return rewindErr
@@ -4246,8 +4246,8 @@ func (ne *NetExplorer) uploadSingle(ctx context.Context, folderID, fileName stri
 			fs.Debugf(nil, "uploadSingle(%q): file still being transferred (423)", fileName)
 			return nil, &httpErr{code: resp.StatusCode, body: "file still being transferred"}
 		case 500:
-			fs.Debugf(nil, "uploadSingle(%q): server error (500)", fileName)
-			return nil, &httpErr{code: resp.StatusCode, body: "server error"}
+			fs.Infof(nil, "uploadSingle(%q): server error (500): %s", fileName, string(bodyBytes))
+			return nil, &httpErr{code: resp.StatusCode, body: string(bodyBytes)}
 		default:
 			return nil, &httpErr{code: resp.StatusCode, body: string(bodyBytes)}
 		}
