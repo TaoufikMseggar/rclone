@@ -43,6 +43,7 @@ import (
 	"go.etcd.io/bbolt"
 	"golang.org/x/oauth2"
 	"golang.org/x/sync/singleflight"
+	"golang.org/x/text/unicode/norm"
 )
 
 var netExplorerForbiddenNameChars = regexp.MustCompile(`[\\/:*?"<>|]`)
@@ -974,8 +975,22 @@ func isAlreadyExists(err error) bool {
 }
 func (f *Fs) kpath(p string) string { return f.ns + p }
 
+// normKey normalizes a path or name to Unicode NFC form before it is used as an
+// index key. Source filesystems differ in how they encode accented characters:
+// macOS produces NFD (decomposed, e.g. "e" + U+0301), while NetExplorer returns
+// names in NFC (composed, e.g. "é" = U+00E9) in its listings. Without
+// normalization, a folder created from an NFD name is stored under an NFD key but
+// hydrated back under an NFC key, so the subsequent lookup misses and we report
+// "not found after creation" / "concurrent creation not visible after waiting"
+// for every accented folder. Normalizing both sides to NFC makes lookups stable
+// regardless of which form the source or the server uses. Only the index key is
+// normalized; the original name is still sent verbatim to the server, so the
+// filename is preserved as-is on NetExplorer.
+func normKey(s string) string { return norm.NFC.String(s) }
+
 // ----- index getters/setters -----
 func (f *Fs) idxGetFolder(p string) (string, bool) {
+	p = normKey(p)
 	if v, ok := f.hot.Get("p:" + f.kpath(p)); ok {
 		return v, true
 	}
@@ -1005,6 +1020,7 @@ func (f *Fs) idxGetFolder(p string) (string, bool) {
 	return "", false
 }
 func (f *Fs) idxPutFolder(p, id string) {
+	p = normKey(p)
 	f.hot.Set("p:"+f.kpath(p), id)
 	f.cacheSet(p, id) // keep legacy map
 	if f.kv != nil {
@@ -1017,6 +1033,7 @@ func (f *Fs) idxPutFolder(p, id string) {
 	}
 }
 func (f *Fs) idxDelFolder(p string) {
+	p = normKey(p)
 	f.hot.Delete("p:" + f.kpath(p))
 	f.cacheDelete(p) // keep legacy map
 	if f.kv != nil {
@@ -1035,6 +1052,7 @@ func (f *Fs) idxDelFolder(p string) {
 // would create a race that re-promotes stale Bolt values back into the hot cache.
 func (f *Fs) evictFolderPathsSync(paths ...string) {
 	for _, p := range paths {
+		p = normKey(p)
 		f.hot.Delete("p:" + f.kpath(p))
 		f.cacheDelete(p)
 	}
@@ -1047,7 +1065,7 @@ func (f *Fs) evictFolderPathsSync(paths ...string) {
 			return nil
 		}
 		for _, p := range paths {
-			_ = b.Delete([]byte(p))
+			_ = b.Delete([]byte(normKey(p)))
 		}
 		return nil
 	})
@@ -1055,6 +1073,7 @@ func (f *Fs) evictFolderPathsSync(paths ...string) {
 
 func kf(parentID, name string) string { return parentID + "|" + name }
 func (f *Fs) idxGetFile(parentID, name string) (string, bool) {
+	name = normKey(name)
 	key := "f:" + kf(parentID, name)
 	if v, ok := f.hot.Get(key); ok {
 		return v, true
@@ -1080,6 +1099,7 @@ func (f *Fs) idxGetFile(parentID, name string) (string, bool) {
 	return "", false
 }
 func (f *Fs) idxPutFile(parentID, name, id string) {
+	name = normKey(name)
 	f.hot.Set("f:"+kf(parentID, name), id)
 	if f.kv != nil {
 		// Async cache write to avoid blocking
@@ -1091,6 +1111,7 @@ func (f *Fs) idxPutFile(parentID, name, id string) {
 	}
 }
 func (f *Fs) idxDelFile(parentID, name string) {
+	name = normKey(name)
 	f.hot.Delete("f:" + kf(parentID, name))
 	if f.kv != nil {
 		// Async cache write to avoid blocking
