@@ -169,18 +169,6 @@ type NetExplorer struct {
 	opt         *Options
 }
 
-// a node in the folder tree returned by depth>1
-type folderNode struct {
-	ID           int       `json:"id"`
-	Name         string    `json:"name"`
-	Creation     time.Time `json:"creation"`
-	Modification time.Time `json:"modification"`
-	Content      struct {
-		Folders []folderNode `json:"folders"`
-		Files   []APIFile    `json:"files"`
-	} `json:"content"`
-}
-
 // CreateFolderResponse models the JSON response from POST /folders
 type CreateFolderResponse struct {
 	ID       int    `json:"id"`
@@ -1157,192 +1145,6 @@ func (f *Fs) hydrateFolder(ctx context.Context, parentID, parentPath string) err
 	return nil
 }
 
-// bulkHydrateFolders efficiently hydrates multiple folders using bulk API calls
-// This reduces API calls from N to 1 for N folders by using NetExplorer's depth parameter
-func (f *Fs) bulkHydrateFolders(ctx context.Context, folderIDs []string) error {
-	if len(folderIDs) == 0 {
-		return nil
-	}
-
-	fs.Debugf(f, "bulkHydrateFolders: hydrating %d folders", len(folderIDs))
-
-	// Use singleflight to prevent duplicate bulk requests
-	key := "bulk:" + strings.Join(folderIDs, ",")
-	_, err, _ := f.listSF.Do(key, func() (any, error) {
-		return nil, f.performBulkHydration(ctx, folderIDs)
-	})
-
-	return err
-}
-
-// performBulkHydration performs the actual bulk hydration using NetExplorer's depth API
-func (f *Fs) performBulkHydration(ctx context.Context, folderIDs []string) error {
-	if len(folderIDs) == 0 {
-		return nil
-	}
-
-	// Group folders by their common root to minimize API calls
-	rootGroups := f.groupFoldersByRoot(folderIDs)
-
-	for rootID, subFolders := range rootGroups {
-		// Use depth parameter for true bulk operations
-		depth := f.calculateOptimalDepth(subFolders)
-		fs.Debugf(f, "bulkHydrateFolders: using depth=%d for root=%s with %d folders", depth, rootID, len(subFolders))
-
-		// Single API call with depth parameter instead of N individual calls
-		folders, files, err := f.ne.ListFolderWithDepth(rootID, depth)
-		if err != nil {
-			fs.Debugf(f, "bulkHydrateFolders: failed to bulk hydrate root %s: %v", rootID, err)
-			// Fallback to individual hydration for this root
-			f.fallbackIndividualHydration(ctx, subFolders)
-			continue
-		}
-
-		// Batch update cache with all discovered folders and files
-		f.batchUpdateCache(folders, files)
-	}
-
-	fs.Debugf(f, "bulkHydrateFolders: completed hydrating %d folders", len(folderIDs))
-	return nil
-}
-
-// groupFoldersByRoot groups folder IDs by their common root
-func (f *Fs) groupFoldersByRoot(folderIDs []string) map[string][]string {
-	groups := make(map[string][]string)
-
-	for _, folderID := range folderIDs {
-		// For now, group by rootID - in a more sophisticated implementation,
-		// you could determine the actual root by walking up the folder tree
-		rootID := f.rootID
-		groups[rootID] = append(groups[rootID], folderID)
-	}
-
-	return groups
-}
-
-// calculateOptimalDepth determines the optimal depth for bulk API calls
-func (f *Fs) calculateOptimalDepth(folderIDs []string) int {
-	// Start with depth 2 to get immediate children
-	// This can be optimized based on folder structure analysis
-	return 2
-}
-
-// batchUpdateCache updates the cache with multiple folders and files at once
-func (f *Fs) batchUpdateCache(folders []APIFolder, files []APIFile) {
-	// Batch update folder cache with metadata
-	for _, folder := range folders {
-		// Note: This function is used for bulk operations where we don't have full path context
-		// For now, we'll use the folder name as the key, but this should be improved
-		// to use full paths when available
-		f.idxPutFolder(folder.Name, strconv.Itoa(folder.ID))
-		// Cache folder metadata to avoid redundant API calls
-		f.cacheFolderMetadata(strconv.Itoa(folder.ID), &folder)
-	}
-
-	// Batch update file cache with metadata
-	for _, file := range files {
-		// Cache file metadata to avoid redundant GetFile calls
-		f.cacheFileMetadata(strconv.Itoa(file.ID), &file)
-		fs.Debugf(f, "batchUpdateCache: cached file %s (ID: %d, size: %d)", file.Name, file.ID, file.Size)
-	}
-}
-
-// fallbackIndividualHydration is used when bulk operations fail
-func (f *Fs) fallbackIndividualHydration(ctx context.Context, folderIDs []string) {
-	fs.Debugf(f, "fallbackIndividualHydration: falling back to individual hydration for %d folders", len(folderIDs))
-
-	batchSize := 5 // Smaller batch size for fallback
-	for i := 0; i < len(folderIDs); i += batchSize {
-		end := i + batchSize
-		if end > len(folderIDs) {
-			end = len(folderIDs)
-		}
-
-		batch := folderIDs[i:end]
-		var wg sync.WaitGroup
-		for _, folderID := range batch {
-			wg.Add(1)
-			go func(id string) {
-				defer wg.Done()
-				if err := f.hydrateFolder(ctx, id, ""); err != nil {
-					fs.Debugf(f, "fallbackIndividualHydration: failed to hydrate folder %s: %v", id, err)
-				}
-			}(folderID)
-		}
-		wg.Wait()
-	}
-}
-
-// warmCache proactively hydrates frequently accessed folders to prevent cache misses
-func (f *Fs) warmCache(ctx context.Context, rootID string) {
-	fs.Debugf(f, "warmCache: starting cache warming for root %s", rootID)
-
-	// Start cache warming in background to avoid blocking
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				fs.Debugf(f, "warmCache: recovered from panic: %v", r)
-			}
-		}()
-
-		// Get root folder contents first
-		folders, _, err := f.ne.ListFolder(rootID)
-		if err != nil {
-			fs.Debugf(f, "warmCache: failed to list root folder: %v", err)
-			return
-		}
-
-		// Extract folder IDs for bulk hydration
-		folderIDs := make([]string, 0, len(folders))
-		for _, folder := range folders {
-			folderIDs = append(folderIDs, strconv.Itoa(folder.ID))
-		}
-
-		// Bulk hydrate all root-level folders
-		if len(folderIDs) > 0 {
-			fs.Debugf(f, "warmCache: bulk hydrating %d root-level folders", len(folderIDs))
-			if err := f.bulkHydrateFolders(ctx, folderIDs); err != nil {
-				fs.Debugf(f, "warmCache: bulk hydration failed: %v", err)
-			}
-		}
-
-		fs.Debugf(f, "warmCache: completed cache warming for root %s", rootID)
-	}()
-}
-
-// preloadFrequentlyAccessedFolders identifies and preloads folders that are accessed frequently
-func (f *Fs) preloadFrequentlyAccessedFolders(ctx context.Context) {
-	fs.Debugf(f, "preloadFrequentlyAccessedFolders: starting smart preloading")
-
-	// Start preloading in background
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				fs.Debugf(f, "preloadFrequentlyAccessedFolders: recovered from panic: %v", r)
-			}
-		}()
-
-		// Get frequently accessed folders from cache statistics
-		// This is a simplified version - in production you'd track access patterns
-		frequentlyAccessed := f.getFrequentlyAccessedFolders()
-
-		if len(frequentlyAccessed) > 0 {
-			fs.Debugf(f, "preloadFrequentlyAccessedFolders: preloading %d frequently accessed folders", len(frequentlyAccessed))
-			if err := f.bulkHydrateFolders(ctx, frequentlyAccessed); err != nil {
-				fs.Debugf(f, "preloadFrequentlyAccessedFolders: preloading failed: %v", err)
-			}
-		}
-	}()
-}
-
-// getFrequentlyAccessedFolders returns a list of folder IDs that are accessed frequently
-// This is a simplified implementation - in production you'd track access patterns
-func (f *Fs) getFrequentlyAccessedFolders() []string {
-	// For now, return empty list - this would be implemented based on access tracking
-	// In a real implementation, you'd track folder access frequency and return the most accessed ones
-	return []string{}
-}
-
 // fastResolveDirID quickly resolves directory ID with caching
 func (f *Fs) fastResolveDirID(ctx context.Context, dir string) (string, error) {
 	f.dirCacheMu.RLock()
@@ -1547,11 +1349,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 				// resolving/creating folders on demand.
 			}
 		}
-
-		// Start cache warming in background for better performance.
-		// This preloads frequently accessed folders to prevent cache misses.
-		f.warmCache(ctx, f.rootID)
-		f.preloadFrequentlyAccessedFolders(ctx)
 	}
 
 	fs.Debugf(f, "NewFs: ready (rootID=%q initialPath=%v)", f.rootID, f.initialPath)
@@ -1857,7 +1654,6 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 	}
 
 	var entries fs.DirEntries
-	var subfolderIDs []string
 
 	for _, af := range apiFolders {
 		subPath := af.Name
@@ -1963,17 +1759,8 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 		// Cache folder metadata to avoid redundant API calls
 		f.cacheFolderMetadata(strconv.Itoa(af.ID), &af)
 		entries = append(entries, fs.NewDir(joinPath(dir, af.Name), af.Modification))
-		subfolderIDs = append(subfolderIDs, strconv.Itoa(af.ID))
 	}
 
-	// Optimize: Bulk hydrate subfolders in background to prevent future cache misses
-	if len(subfolderIDs) > 0 {
-		go func() {
-			if err := f.bulkHydrateFolders(ctx, subfolderIDs); err != nil {
-				fs.Debugf(f, "List(%q): background bulk hydration failed: %v", dir, err)
-			}
-		}()
-	}
 	for _, af := range apiFiles {
 		folderIDStr := folderID // available above
 		f.idxPutFile(folderIDStr, af.Name, strconv.Itoa(af.ID))
@@ -4509,76 +4296,6 @@ func (ne *NetExplorer) ListFolder(folderID string) ([]APIFolder, []APIFile, erro
 	fs.Debugf(nil, "ListFolder(%s): shape=wrapper -> folders=%d files=%d",
 		folderID, len(wrapper.Content.Folders), len(wrapper.Content.Files))
 	return wrapper.Content.Folders, wrapper.Content.Files, nil
-}
-
-// ListFolderWithDepth lists folders and files with a specific depth for bulk operations
-func (ne *NetExplorer) ListFolderWithDepth(folderID string, depth int) ([]APIFolder, []APIFile, error) {
-	url := fmt.Sprintf("%s/api/folder/%s?depth=%d", ne.BaseURL, folderID, depth)
-	fs.Debugf(nil, "ListFolderWithDepth: GET %s", url)
-
-	start := time.Now()
-	resp, err := ne.doRequestWithReauth(func(token string) (*http.Request, error) {
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Authorization", "Bearer "+token)
-		req.Header.Del("Expect")
-		return req, nil
-	}, false)
-	dt := time.Since(start)
-	if err != nil {
-		fs.Debugf(nil, "ListFolderWithDepth(%s, depth=%d): HTTP error after %v: %v", folderID, depth, dt, err)
-		return nil, nil, err
-	}
-	defer closeResponseBody(resp)
-	fs.Debugf(nil, "ListFolderWithDepth(%s, depth=%d): status=%d in %v", folderID, depth, resp.StatusCode, dt)
-
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fs.Debugf(nil, "ListFolderWithDepth(%s, depth=%d): read body error: %v", folderID, depth, err)
-		return nil, nil, err
-	}
-	fs.Debugf(nil, "ListFolderWithDepth(%s, depth=%d): body bytes=%d", folderID, depth, len(raw))
-	if resp.StatusCode != http.StatusOK {
-		return nil, nil, &httpErr{code: resp.StatusCode, body: string(raw)}
-	}
-
-	// Parse the response - with depth > 1, we expect a nested structure
-	var root struct {
-		Content struct {
-			Folders []APIFolder `json:"folders"`
-			Files   []APIFile   `json:"files"`
-		} `json:"content"`
-	}
-	if err := json.Unmarshal(raw, &root); err != nil {
-		return nil, nil, fmt.Errorf("unmarshal depth response: %w - raw: %s", err, raw)
-	}
-
-	// For bulk operations, we need to flatten the nested structure
-	allFolders, allFiles := ne.flattenDepthResponse(root.Content.Folders, root.Content.Files)
-
-	fs.Debugf(nil, "ListFolderWithDepth(%s, depth=%d): flattened -> folders=%d files=%d",
-		folderID, depth, len(allFolders), len(allFiles))
-	return allFolders, allFiles, nil
-}
-
-// flattenDepthResponse flattens nested folder structures for bulk operations
-func (ne *NetExplorer) flattenDepthResponse(folders []APIFolder, files []APIFile) ([]APIFolder, []APIFile) {
-	allFolders := make([]APIFolder, 0, len(folders))
-	allFiles := make([]APIFile, 0, len(files))
-
-	// Add current level files
-	allFiles = append(allFiles, files...)
-
-	// Add current level folders
-	allFolders = append(allFolders, folders...)
-
-	// Note: In a real implementation, you'd need to recursively process
-	// the folder's content. For now, we'll just add the folders themselves.
-	// The actual nested content would need to be extracted from the API response.
-
-	return allFolders, allFiles
 }
 
 // ---------------------------------------------------------------------
